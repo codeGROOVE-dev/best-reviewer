@@ -18,6 +18,7 @@ type GitHubClient struct {
 	token      string
 	httpClient *http.Client
 	cache      *cache
+	userCache  *userCache
 }
 
 // PullRequest represents a GitHub pull request.
@@ -81,6 +82,7 @@ func newGitHubClient() (*GitHubClient, error) {
 		token:      token,
 		httpClient: &http.Client{Timeout: time.Duration(httpTimeout) * time.Second},
 		cache:      newCache(cacheTTL),
+		userCache:  newUserCache(),
 	}, nil
 }
 
@@ -377,7 +379,80 @@ func (rf *ReviewerFinder) getRecentPRCommenters(ctx context.Context, owner, repo
 
 // isUserBot checks if a user is a bot.
 func (rf *ReviewerFinder) isUserBot(ctx context.Context, username string) bool {
-	return strings.HasSuffix(username, "[bot]") || strings.HasSuffix(username, "-bot")
+	lower := strings.ToLower(username)
+	
+	// Check for common bot patterns
+	botPatterns := []string{
+		"[bot]",
+		"-bot",
+		"_bot",
+		"bot-",
+		"bot_",
+		".bot",
+		"github-actions",
+		"dependabot",
+		"renovate",
+		"greenkeeper",
+		"snyk",
+		"codecov",
+		"coveralls",
+		"travis",
+		"circleci",
+		"jenkins",
+		"buildkite",
+		"semaphore",
+		"appveyor",
+		"azure-pipelines",
+		"github-classroom",
+		"imgbot",
+		"allcontributors",
+		"whitesource",
+		"mergify",
+		"sonarcloud",
+		"deepsource",
+		"codefactor",
+		"lgtm",
+		"codacy",
+		"hound",
+		"stale",
+	}
+	
+	for _, pattern := range botPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	
+	// Check for common organization/service account patterns
+	orgPatterns := []string{
+		"octo-sts",
+		"octocat",
+		"-sts",
+		"-svc",
+		"-service",
+		"-system",
+		"-automation",
+		"-ci",
+		"-cd",
+		"-deploy",
+		"-release",
+		"release-manager",
+		"-build",
+		"-test",
+		"-admin",
+		"-security",
+		"security-scanner",
+		"-compliance",
+		"compliance-checker",
+	}
+	
+	for _, pattern := range orgPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	
+	return false
 }
 
 // hasWriteAccess checks if a user has write access to the repository.

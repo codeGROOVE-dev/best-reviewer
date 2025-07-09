@@ -219,7 +219,25 @@ func (rf *ReviewerFinder) findAssigneeExpert(ctx context.Context, pr *PullReques
 
 // isValidReviewer checks if a user is a valid reviewer.
 func (rf *ReviewerFinder) isValidReviewer(ctx context.Context, pr *PullRequest, username string) bool {
-	return !rf.isUserBot(ctx, username) && rf.hasWriteAccess(ctx, pr.Owner, pr.Repository, username)
+	// First check pattern-based bot detection
+	if rf.isUserBot(ctx, username) {
+		if rf.output != nil && rf.output.verbose {
+			fmt.Printf("    Filtered (bot pattern): %s\n", username)
+		}
+		return false
+	}
+	
+	// Then check GitHub API for user type
+	uType, err := rf.client.getUserType(ctx, username)
+	if err == nil && (uType == userTypeOrg || uType == userTypeBot) {
+		if rf.output != nil && rf.output.verbose {
+			fmt.Printf("    Filtered (%s): %s\n", uType, username)
+		}
+		return false
+	}
+	
+	// Finally check write access
+	return rf.hasWriteAccess(ctx, pr.Owner, pr.Repository, username)
 }
 
 // findExpertReviewer finds the most active reviewer for the changes.
