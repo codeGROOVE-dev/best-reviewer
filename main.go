@@ -18,8 +18,8 @@ var (
 	// Behavior flags
 	poll        = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
 	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual approvals)")
-	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time PR since last commit or review for PR assignment")
-	maxOpenTime = flag.Duration("max-age", 180*24*time.Hour, "Maximum time PR since last commit or review for PR assignment")
+	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
+	maxOpenTime = flag.Duration("max-age", 180*24*time.Hour, "Maximum time since last activity for PR assignment")
 )
 
 func main() {
@@ -35,23 +35,25 @@ func main() {
 		log.Fatalf("Failed to create GitHub client: %v", err)
 	}
 
-	reviewer := &ReviewerFinder{
+	finder := &ReviewerFinder{
 		client:      client,
 		dryRun:      *dryRun,
 		minOpenTime: *minOpenTime,
 		maxOpenTime: *maxOpenTime,
+		output:      &outputFormatter{verbose: false},
 	}
 
 	if *poll > 0 {
 		log.Printf("Starting polling mode with interval: %v", *poll)
-		reviewer.startPolling(ctx, *poll)
+		finder.startPolling(ctx, *poll)
 	} else {
-		if err := reviewer.findAndAssignReviewers(ctx); err != nil {
+		if err := finder.findAndAssignReviewers(ctx); err != nil {
 			log.Fatalf("Failed to find and assign reviewers: %v", err)
 		}
 	}
 }
 
+// validateFlags ensures exactly one target flag is set.
 func validateFlags() error {
 	targetFlags := 0
 	if *prURL != "" {
@@ -71,6 +73,7 @@ func validateFlags() error {
 	return nil
 }
 
+// usage prints usage information.
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\nTarget flags (mutually exclusive):\n")

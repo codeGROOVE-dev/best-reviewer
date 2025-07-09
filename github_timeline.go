@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -43,7 +42,6 @@ func (c *GitHubClient) getReviewerRequestedTimes(ctx context.Context, owner, rep
 			if existingTime, exists := reviewerTimes[event.RequestedReviewer.Login]; !exists || event.CreatedAt.Before(existingTime) {
 				reviewerTimes[event.RequestedReviewer.Login] = event.CreatedAt
 			}
-			log.Printf("Found review request for %s at %s", event.RequestedReviewer.Login, event.CreatedAt.Format(time.RFC3339))
 		}
 	}
 	
@@ -67,7 +65,6 @@ func (c *GitHubClient) getStaleReviewers(ctx context.Context, pr *PullRequest, s
 	for _, reviewer := range pr.Reviewers {
 		if requestedTime, exists := reviewerTimes[reviewer]; exists {
 			if requestedTime.Before(cutoffTime) {
-				log.Printf("Reviewer %s is stale (requested %s ago)", reviewer, time.Since(requestedTime).Round(time.Hour))
 				staleReviewers = append(staleReviewers, reviewer)
 			}
 		}
@@ -98,6 +95,5 @@ func (c *GitHubClient) removeReviewers(ctx context.Context, owner, repo string, 
 		return fmt.Errorf("failed to remove reviewers (status %d)", resp.StatusCode)
 	}
 	
-	log.Printf("Successfully removed reviewers %v from PR %d", reviewers, prNumber)
 	return nil
 }

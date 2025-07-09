@@ -2,405 +2,282 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
-	"sort"
 	"strings"
 	"time"
 )
 
-// ReviewerFinder finds and assigns reviewers to pull requests
+// ReviewerFinder finds and assigns reviewers to pull requests.
 type ReviewerFinder struct {
-	client       *GitHubClient
-	dryRun       bool
-	minOpenTime  time.Duration
-	maxOpenTime  time.Duration
-	prPatchCache map[string]map[string]string // Cache for PR file patches
+	client      *GitHubClient
+	dryRun      bool
+	minOpenTime time.Duration
+	maxOpenTime time.Duration
+	output      *outputFormatter
 }
 
-// startPolling starts the polling loop for monitoring PRs
-func (rf *ReviewerFinder) startPolling(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Polling stopped due to context cancellation")
-			return
-		case <-ticker.C:
-			if err := rf.findAndAssignReviewers(ctx); err != nil {
-				log.Printf("Error during polling iteration: %v", err)
-			}
-		}
-	}
-}
-
-// findAndAssignReviewers is the main entry point for finding and assigning reviewers
+// findAndAssignReviewers is the main entry point for finding and assigning reviewers.
 func (rf *ReviewerFinder) findAndAssignReviewers(ctx context.Context) error {
 	var prs []*PullRequest
 	var err error
+	var processed, assigned, skipped int
 
-	if *prURL != "" {
-		// Single PR mode
-		owner, repo, prNumber, err := parsePRURL(*prURL)
+	// Get PRs based on the target flag
+	switch {
+	case *prURL != "":
+		pr, err := rf.getPRFromURL(ctx, *prURL)
 		if err != nil {
-			return fmt.Errorf("failed to parse PR URL: %w", err)
-		}
-		
-		pr, err := rf.client.getPullRequest(ctx, owner, repo, prNumber)
-		if err != nil {
-			return fmt.Errorf("failed to get pull request: %w", err)
+			return fmt.Errorf("failed to get PR: %w", err)
 		}
 		prs = []*PullRequest{pr}
-	} else if *project != "" {
-		// Project mode
+	case *project != "":
 		prs, err = rf.getPRsForProject(ctx, *project)
 		if err != nil {
 			return fmt.Errorf("failed to get PRs for project: %w", err)
 		}
-	} else if *org != "" {
-		// Organization mode
+	case *org != "":
 		prs, err = rf.getPRsForOrg(ctx, *org)
 		if err != nil {
 			return fmt.Errorf("failed to get PRs for organization: %w", err)
 		}
 	}
 
-	log.Printf("Found %d pull request(s) to analyze", len(prs))
 
-	for _, pr := range prs {
-		if err := rf.processPR(ctx, pr); err != nil {
-			log.Printf("Error processing PR %s/%s#%d: %v", pr.Owner, pr.Repository, pr.Number, err)
+	for i, pr := range prs {
+		// Show progress
+		if i > 0 {
+			fmt.Println()
 		}
+		
+		processed++
+		wasAssigned, err := rf.processPR(ctx, pr)
+		if err != nil {
+			fmt.Printf("  ❌ Error processing PR #%d: %v\n", pr.Number, err)
+		} else if wasAssigned {
+			assigned++
+		} else {
+			skipped++
+		}
+	}
+	
+	// Print summary
+	if processed > 0 {
+		fmt.Print(rf.output.formatSummary(processed, assigned, skipped))
 	}
 
 	return nil
 }
 
-// processPR processes a single pull request for reviewer assignment
-func (rf *ReviewerFinder) processPR(ctx context.Context, pr *PullRequest) error {
-	draftStatus := ""
-	if pr.Draft {
-		draftStatus = " [DRAFT]"
-	}
-	log.Printf("Processing PR %s/%s#%d%s: %s", pr.Owner, pr.Repository, pr.Number, draftStatus, pr.Title)
-
-	// Note: We process closed PRs to show recommendations, but won't assign reviewers
+// processPR processes a single pull request for reviewer assignment.
+func (rf *ReviewerFinder) processPR(ctx context.Context, pr *PullRequest) (bool, error) {
+	// Print PR header
+	fmt.Print(rf.output.formatPRHeader(pr))
 
 	// Check for stale reviewers (assigned over 5 days ago)
 	needsAdditionalReviewers := false
 	if len(pr.Reviewers) > 0 {
 		staleReviewers, err := rf.client.getStaleReviewers(ctx, pr, 5*24*time.Hour)
-		if err != nil {
-			log.Printf("Warning: Failed to check stale reviewers: %v", err)
-		} else if len(staleReviewers) > 0 {
-			log.Printf("Found %d stale reviewers on PR %d: %v", len(staleReviewers), pr.Number, staleReviewers)
-			log.Printf("Will add additional reviewers since existing ones are stale")
+		if err == nil && len(staleReviewers) > 0 {
 			needsAdditionalReviewers = true
 		}
 	}
 
 	// Check PR age constraints (skip if we need additional reviewers due to staleness)
-	if !needsAdditionalReviewers {
-		now := time.Now()
-		lastActivity := pr.LastCommit
-		if pr.LastReview.After(lastActivity) {
-			lastActivity = pr.LastReview
-		}
-
-		timeSinceActivity := now.Sub(lastActivity)
-		if timeSinceActivity < rf.minOpenTime {
-			log.Printf("Skipping PR %d: too recent (age: %v, min: %v)", pr.Number, timeSinceActivity, rf.minOpenTime)
-			return nil
-		}
-
-		if timeSinceActivity > rf.maxOpenTime {
-			log.Printf("Skipping PR %d: too old (age: %v, max: %v)", pr.Number, timeSinceActivity, rf.maxOpenTime)
-			return nil
-		}
+	if !needsAdditionalReviewers && !rf.isPRReady(pr) {
+		fmt.Printf("  ⏭️  Skipping (outside time window)\n")
+		return false, nil
 	}
 
-	// Find reviewer candidates using V5 logic (line overlap analysis)
-	candidates, err := rf.findReviewersV5(ctx, pr)
+	// Find reviewer candidates
+	candidates, err := rf.findReviewers(ctx, pr)
 	if err != nil {
-		return fmt.Errorf("failed to find reviewer candidates: %w", err)
+		return false, fmt.Errorf("failed to find reviewer candidates: %w", err)
 	}
 
 	// If we need additional reviewers, filter out existing ones
-	if needsAdditionalReviewers && len(candidates) > 0 {
-		var filteredCandidates []ReviewerCandidate
-		for _, candidate := range candidates {
-			isExisting := false
-			for _, existing := range pr.Reviewers {
-				if candidate.Username == existing {
-					isExisting = true
-					break
-				}
-			}
-			if !isExisting {
-				filteredCandidates = append(filteredCandidates, candidate)
-			}
-		}
-		candidates = filteredCandidates
-		log.Printf("After filtering existing reviewers, found %d new candidates for PR %d", len(candidates), pr.Number)
+	if needsAdditionalReviewers {
+		candidates = rf.filterExistingReviewers(candidates, pr.Reviewers)
 	}
 
-	log.Printf("Found %d reviewer candidates for PR %d", len(candidates), pr.Number)
-
-	// Assign reviewers based on candidates
-	return rf.assignReviewersV3(ctx, pr, candidates)
-}
-
-// findReviewerCandidates finds potential reviewers for a PR
-func (rf *ReviewerFinder) findReviewerCandidates(ctx context.Context, pr *PullRequest) ([]ReviewerCandidate, error) {
-	// Get top 3 files with most changes
-	topFiles := rf.getTopChangedFiles(pr, 3)
-	log.Printf("Top changed files for PR %d: %v", pr.Number, topFiles)
-
-	// Find context-based reviewers
-	contextCandidates, err := rf.findContextReviewers(ctx, pr, topFiles)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find context reviewers: %w", err)
-	}
-
-	// Find activity-based reviewers
-	activityCandidates, err := rf.findActivityReviewers(ctx, pr, topFiles)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find activity reviewers: %w", err)
-	}
-
-	// Combine and deduplicate candidates
-	candidateMap := make(map[string]*ReviewerCandidate)
+	// Display candidates
+	fmt.Print(rf.output.formatCandidates(candidates, pr.Reviewers))
 	
-	for _, candidate := range contextCandidates {
-		candidateMap[candidate.Username] = &candidate
-	}
-	
-	for _, candidate := range activityCandidates {
-		if existing, exists := candidateMap[candidate.Username]; exists {
-			existing.ActivityScore = candidate.ActivityScore
-			if candidate.LastActivity.After(existing.LastActivity) {
-				existing.LastActivity = candidate.LastActivity
-			}
-		} else {
-			candidateMap[candidate.Username] = &candidate
-		}
-	}
-
-	var candidates []ReviewerCandidate
-	for _, candidate := range candidateMap {
-		// Skip the PR author
-		if candidate.Username == pr.Author {
-			continue
-		}
-		candidates = append(candidates, *candidate)
-	}
-	
-	// Use fallback mechanisms if no candidates were found
 	if len(candidates) == 0 {
-		log.Printf("No context or activity candidates found, using fallback mechanisms")
-		fallbackCandidates, err := rf.getFallbackReviewers(ctx, pr, topFiles)
-		if err != nil {
-			log.Printf("Failed to get fallback reviewers: %v", err)
-		} else {
-			candidates = append(candidates, fallbackCandidates...)
-		}
+		return false, nil
 	}
 
-	// Sort by combined score (context + activity)
-	sort.Slice(candidates, func(i, j int) bool {
-		scoreI := candidates[i].ContextScore + candidates[i].ActivityScore
-		scoreJ := candidates[j].ContextScore + candidates[j].ActivityScore
-		if scoreI == scoreJ {
-			return candidates[i].LastActivity.After(candidates[j].LastActivity)
-		}
-		return scoreI > scoreJ
-	})
-
-	return candidates, nil
+	// Assign reviewers
+	assigned, err := rf.assignReviewers(ctx, pr, candidates)
+	return assigned, err
 }
 
-// getTopChangedFiles returns the top N files with the most changes
-func (rf *ReviewerFinder) getTopChangedFiles(pr *PullRequest, n int) []string {
-	if len(pr.ChangedFiles) <= n {
-		var files []string
-		for _, file := range pr.ChangedFiles {
-			files = append(files, file.Filename)
-		}
-		return files
+// isPRReady checks if a PR is ready for reviewer assignment based on age constraints.
+func (rf *ReviewerFinder) isPRReady(pr *PullRequest) bool {
+	lastActivity := pr.LastCommit
+	if pr.LastReview.After(lastActivity) {
+		lastActivity = pr.LastReview
 	}
 
-	var files []string
-	for i := 0; i < n; i++ {
-		files = append(files, pr.ChangedFiles[i].Filename)
+	timeSinceActivity := time.Since(lastActivity)
+	
+	if timeSinceActivity < rf.minOpenTime {
+		return false
 	}
-	return files
+
+	if timeSinceActivity > rf.maxOpenTime {
+		return false
+	}
+
+	return true
 }
 
-// findContextReviewers finds reviewers based on context in changed lines
-func (rf *ReviewerFinder) findContextReviewers(ctx context.Context, pr *PullRequest, files []string) ([]ReviewerCandidate, error) {
-	log.Printf("Finding context reviewers for %d files", len(files))
-	
-	candidateScores := make(map[string]int)
-	
-	for _, filename := range files {
-		log.Printf("Analyzing blame data for file: %s", filename)
-		
-		// Get blame data for the file
-		blameData, err := rf.getBlameData(ctx, pr.Owner, pr.Repository, filename, pr.Number)
-		if err != nil {
-			log.Printf("Failed to get blame data for %s: %v", filename, err)
-			continue
-		}
-		
-		// Find PRs that modified the lines being changed
-		relatedPRs, err := rf.findRelatedPRs(ctx, pr, filename, blameData)
-		if err != nil {
-			log.Printf("Failed to find related PRs for %s: %v", filename, err)
-			continue
-		}
-		
-		// Get approvers for those PRs and score them
-		for _, relatedPR := range relatedPRs {
-			approvers, err := rf.getPRApprovers(ctx, pr.Owner, pr.Repository, relatedPR.Number)
-			if err != nil {
-				log.Printf("Failed to get approvers for PR %d: %v", relatedPR.Number, err)
-				continue
-			}
-			
-			// Score approvers based on lines they reviewed
-			for _, approver := range approvers {
-				candidateScores[approver] += relatedPR.LinesReviewed
-			}
-		}
+// filterExistingReviewers removes candidates who are already reviewers.
+func (rf *ReviewerFinder) filterExistingReviewers(candidates []ReviewerCandidate, existing []string) []ReviewerCandidate {
+	existingMap := make(map[string]bool)
+	for _, r := range existing {
+		existingMap[r] = true
 	}
 	
+	var filtered []ReviewerCandidate
+	for _, c := range candidates {
+		if !existingMap[c.Username] {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// findReviewers finds appropriate reviewers for a PR.
+func (rf *ReviewerFinder) findReviewers(ctx context.Context, pr *PullRequest) ([]ReviewerCandidate, error) {
+	files := rf.getChangedFiles(pr)
+	
+	// Pre-fetch all PR file patches
+	patchCache, _ := rf.fetchAllPRFiles(ctx, pr.Owner, pr.Repository, pr.Number)
+
+	// Find expert author (code ownership context)
+	author, authorMethod := rf.findExpertAuthor(ctx, pr, files, patchCache)
+	
+	// Find expert reviewer (review activity context)  
+	reviewer, reviewerMethod := rf.findExpertReviewer(ctx, pr, files, patchCache, author)
+
+	// Build final candidate list
 	var candidates []ReviewerCandidate
-	for username, score := range candidateScores {
+	
+	if author != "" && author != pr.Author {
 		candidates = append(candidates, ReviewerCandidate{
-			Username:     username,
-			ContextScore: score,
+			Username:        author,
+			SelectionMethod: authorMethod,
+			ContextScore:    100,
 		})
 	}
 	
-	log.Printf("Found %d context-based candidates", len(candidates))
-	return candidates, nil
-}
-
-// findActivityReviewers finds reviewers based on recent activity
-func (rf *ReviewerFinder) findActivityReviewers(ctx context.Context, pr *PullRequest, files []string) ([]ReviewerCandidate, error) {
-	log.Printf("Finding activity reviewers for %d files", len(files))
-	
-	candidateScores := make(map[string]int)
-	candidateActivity := make(map[string]time.Time)
-	
-	for _, filename := range files {
-		log.Printf("Finding recent PRs for file: %s", filename)
-		
-		// Find the most recent PR that modified this file
-		recentPRs, err := rf.findRecentPRsForFile(ctx, pr.Owner, pr.Repository, filename)
-		if err != nil {
-			log.Printf("Failed to find recent PRs for %s: %v", filename, err)
-			continue
-		}
-		
-		// Get approvers for recent PRs and score them by PR size
-		for _, recentPR := range recentPRs {
-			approvers, err := rf.getPRApprovers(ctx, pr.Owner, pr.Repository, recentPR.Number)
-			if err != nil {
-				log.Printf("Failed to get approvers for PR %d: %v", recentPR.Number, err)
-				continue
-			}
-			
-			for _, approver := range approvers {
-				candidateScores[approver] += recentPR.Size
-				if recentPR.MergedAt.After(candidateActivity[approver]) {
-					candidateActivity[approver] = recentPR.MergedAt
-				}
-			}
-		}
-	}
-	
-	var candidates []ReviewerCandidate
-	for username, score := range candidateScores {
+	if reviewer != "" && reviewer != pr.Author && reviewer != author {
 		candidates = append(candidates, ReviewerCandidate{
-			Username:      username,
-			ActivityScore: score,
-			LastActivity:  candidateActivity[username],
+			Username:        reviewer,
+			SelectionMethod: reviewerMethod,
+			ContextScore:    50,
 		})
 	}
-	
-	log.Printf("Found %d activity-based candidates", len(candidates))
+
 	return candidates, nil
 }
 
-// assignReviewers assigns reviewers to a PR
-func (rf *ReviewerFinder) assignReviewers(ctx context.Context, pr *PullRequest, candidates []ReviewerCandidate) error {
-	if len(candidates) == 0 {
-		log.Printf("No reviewer candidates found for PR %d", pr.Number)
-		return nil
+// findExpertAuthor finds the most relevant code author for the changes.
+func (rf *ReviewerFinder) findExpertAuthor(ctx context.Context, pr *PullRequest, files []string, patchCache map[string]string) (string, string) {
+	// Check assignees first
+	if assignee := rf.findAssigneeExpert(ctx, pr); assignee != "" {
+		return assignee, selectionAssignee
 	}
 
-	// Check existing reviewers and their assignment time
-	existingReviewers := make(map[string]bool)
-	for _, reviewer := range pr.Reviewers {
-		existingReviewers[reviewer] = true
+	// Check line overlap
+	if author := rf.findOverlappingAuthor(ctx, pr, files, patchCache); author != "" {
+		return author, selectionAuthorOverlap
 	}
 
-	var reviewersToAdd []string
-	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	// Check directory authors
+	if author := rf.findDirectoryAuthor(ctx, pr, files); author != "" {
+		return author, selectionAuthorDirectory
+	}
 
-	// Find best context reviewer
-	for _, candidate := range candidates {
-		if candidate.ContextScore > 0 {
-			if existingReviewers[candidate.Username] {
-				// If already assigned and more than 2 days, try next candidate
-				if pr.LastReview.Before(twoDaysAgo) {
-					continue
-				}
-			}
-			reviewersToAdd = append(reviewersToAdd, candidate.Username)
-			log.Printf("Selected context reviewer: %s (score: %d)", candidate.Username, candidate.ContextScore)
-			break
+	// Check project authors
+	if author := rf.findProjectAuthor(ctx, pr); author != "" {
+		return author, selectionAuthorProject
+	}
+
+	return "", ""
+}
+
+// findAssigneeExpert checks if any PR assignees can be expert authors.
+func (rf *ReviewerFinder) findAssigneeExpert(ctx context.Context, pr *PullRequest) string {
+	for _, assignee := range pr.Assignees {
+		if assignee != pr.Author && rf.isValidReviewer(ctx, pr, assignee) {
+			return assignee
 		}
 	}
+	return ""
+}
 
-	// Find best activity reviewer
-	for _, candidate := range candidates {
-		if candidate.ActivityScore > 0 && candidate.Username != reviewersToAdd[0] {
-			if existingReviewers[candidate.Username] {
-				// If already assigned and more than 2 days, try next candidate
-				if pr.LastReview.Before(twoDaysAgo) {
-					continue
-				}
-			}
-			reviewersToAdd = append(reviewersToAdd, candidate.Username)
-			log.Printf("Selected activity reviewer: %s (score: %d)", candidate.Username, candidate.ActivityScore)
-			break
-		}
+// isValidReviewer checks if a user is a valid reviewer.
+func (rf *ReviewerFinder) isValidReviewer(ctx context.Context, pr *PullRequest, username string) bool {
+	return !rf.isUserBot(ctx, username) && rf.hasWriteAccess(ctx, pr.Owner, pr.Repository, username)
+}
+
+// findExpertReviewer finds the most active reviewer for the changes.
+func (rf *ReviewerFinder) findExpertReviewer(ctx context.Context, pr *PullRequest, files []string, patchCache map[string]string, excludeAuthor string) (string, string) {
+	// Check recent commenters
+	if reviewer := rf.findCommenterReviewer(ctx, pr, excludeAuthor); reviewer != "" {
+		return reviewer, selectionReviewerCommenter
 	}
 
-	if len(reviewersToAdd) == 0 {
-		log.Printf("No new reviewers to add for PR %d", pr.Number)
-		return nil
+	// Check line overlap
+	if reviewer := rf.findOverlappingReviewer(ctx, pr, files, patchCache, excludeAuthor); reviewer != "" {
+		return reviewer, selectionReviewerOverlap
+	}
+
+	// Check directory reviewers
+	if reviewer := rf.findDirectoryReviewer(ctx, pr, files, excludeAuthor); reviewer != "" {
+		return reviewer, selectionReviewerDirectory
+	}
+
+	// Check project reviewers
+	if reviewer := rf.findProjectReviewer(ctx, pr, excludeAuthor); reviewer != "" {
+		return reviewer, selectionReviewerProject
+	}
+
+	return "", ""
+}
+
+// assignReviewers assigns the selected reviewers to a PR.
+func (rf *ReviewerFinder) assignReviewers(ctx context.Context, pr *PullRequest, candidates []ReviewerCandidate) (bool, error) {
+	// Skip draft or closed PRs
+	if pr.Draft || pr.State == "closed" {
+		return false, nil
+	}
+
+	// Extract reviewer names
+	var reviewerNames []string
+	for _, candidate := range candidates {
+		reviewerNames = append(reviewerNames, candidate.Username)
 	}
 
 	if rf.dryRun {
-		log.Printf("DRY RUN: Would add reviewers %v to PR %d", reviewersToAdd, pr.Number)
-		return nil
+		fmt.Print(rf.output.formatAction("dry-run", pr, reviewerNames))
+		return true, nil
 	}
 
 	// Actually add reviewers
-	return rf.addReviewers(ctx, pr, reviewersToAdd)
+	err := rf.addReviewers(ctx, pr, reviewerNames)
+	if err == nil {
+		fmt.Print(rf.output.formatAction("assigned", pr, reviewerNames))
+		return true, nil
+	}
+	return false, err
 }
 
-// addReviewers adds reviewers to a PR
+// addReviewers makes the API call to add reviewers to a PR.
 func (rf *ReviewerFinder) addReviewers(ctx context.Context, pr *PullRequest, reviewers []string) error {
-	log.Printf("Adding reviewers %v to PR %s/%s#%d", reviewers, pr.Owner, pr.Repository, pr.Number)
-	
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers", pr.Owner, pr.Repository, pr.Number)
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers", 
+		pr.Owner, pr.Repository, pr.Number)
 	
 	payload := map[string]interface{}{
 		"reviewers": reviewers,
@@ -416,58 +293,93 @@ func (rf *ReviewerFinder) addReviewers(ctx context.Context, pr *PullRequest, rev
 		return fmt.Errorf("failed to add reviewers (status %d)", resp.StatusCode)
 	}
 	
-	log.Printf("Successfully added reviewers %v to PR %d", reviewers, pr.Number)
 	return nil
 }
 
-// getPRsForProject gets PRs for a specific project
-func (rf *ReviewerFinder) getPRsForProject(ctx context.Context, project string) ([]*PullRequest, error) {
-	parts := strings.Split(project, "/")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid project format: %s (expected owner/repo)", project)
+// getChangedFiles returns the list of changed files, limiting to the most changed.
+func (rf *ReviewerFinder) getChangedFiles(pr *PullRequest) []string {
+	// Sort by total changes (additions + deletions)
+	type fileChange struct {
+		name    string
+		changes int
 	}
 	
-	owner, repo := parts[0], parts[1]
-	return rf.getOpenPRs(ctx, owner, repo)
-}
-
-// getPRsForOrg gets PRs for an entire organization
-func (rf *ReviewerFinder) getPRsForOrg(ctx context.Context, org string) ([]*PullRequest, error) {
-	// This would need to be implemented to search across all repos in an org
-	// For now, return an error as this requires more complex logic
-	return nil, fmt.Errorf("organization monitoring not yet implemented")
-}
-
-// getOpenPRs gets open PRs for a repository
-func (rf *ReviewerFinder) getOpenPRs(ctx context.Context, owner, repo string) ([]*PullRequest, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls?state=open", owner, repo)
-	resp, err := rf.client.makeRequest(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch open PRs: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("failed to fetch open PRs (status %d)", resp.StatusCode)
+	fileChanges := make([]fileChange, 0, len(pr.ChangedFiles))
+	for _, f := range pr.ChangedFiles {
+		fileChanges = append(fileChanges, fileChange{
+			name:    f.Filename,
+			changes: f.Additions + f.Deletions,
+		})
 	}
 	
-	var prs []struct {
-		Number int `json:"number"`
-	}
-	
-	if err := json.NewDecoder(resp.Body).Decode(&prs); err != nil {
-		return nil, fmt.Errorf("failed to decode PRs: %w", err)
-	}
-	
-	var result []*PullRequest
-	for _, pr := range prs {
-		fullPR, err := rf.client.getPullRequest(ctx, owner, repo, pr.Number)
-		if err != nil {
-			log.Printf("Failed to get PR %d: %v", pr.Number, err)
-			continue
+	// Simple bubble sort (good enough for small lists)
+	for i := 0; i < len(fileChanges); i++ {
+		for j := i + 1; j < len(fileChanges); j++ {
+			if fileChanges[j].changes > fileChanges[i].changes {
+				fileChanges[i], fileChanges[j] = fileChanges[j], fileChanges[i]
+			}
 		}
-		result = append(result, fullPR)
 	}
 	
-	return result, nil
+	// Extract filenames, limit to maxFilesToAnalyze
+	files := make([]string, 0, len(fileChanges))
+	for i, fc := range fileChanges {
+		if i >= maxFilesToAnalyze {
+			break
+		}
+		files = append(files, fc.name)
+	}
+	
+	return files
+}
+
+// getDirectories extracts unique directories from file paths.
+func (rf *ReviewerFinder) getDirectories(files []string) []string {
+	dirMap := make(map[string]bool)
+	for _, file := range files {
+		parts := strings.Split(file, "/")
+		for i := 1; i <= len(parts)-1; i++ {
+			dir := strings.Join(parts[:i], "/")
+			dirMap[dir] = true
+		}
+	}
+	
+	dirs := make([]string, 0, len(dirMap))
+	for dir := range dirMap {
+		dirs = append(dirs, dir)
+	}
+	
+	// Sort by depth (deeper first) - simple approach
+	for i := 0; i < len(dirs); i++ {
+		for j := i + 1; j < len(dirs); j++ {
+			if strings.Count(dirs[j], "/") > strings.Count(dirs[i], "/") {
+				dirs[i], dirs[j] = dirs[j], dirs[i]
+			}
+		}
+	}
+	
+	return dirs
+}
+
+// startPolling runs the reviewer finder in polling mode.
+func (rf *ReviewerFinder) startPolling(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run immediately
+	if err := rf.findAndAssignReviewers(ctx); err != nil {
+		fmt.Printf("Error in initial run: %v\n", err)
+	}
+
+	// Then run periodically
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := rf.findAndAssignReviewers(ctx); err != nil {
+				fmt.Printf("Error in polling run: %v\n", err)
+			}
+		}
+	}
 }
