@@ -7,53 +7,68 @@ import (
 
 // cacheEntry holds a cached value with expiration.
 type cacheEntry struct {
-	value      interface{}
+	value      any
 	expiration time.Time
 }
 
 // cache provides thread-safe caching with TTL.
 type cache struct {
-	mu      sync.RWMutex
 	entries map[string]cacheEntry
+	mu      sync.RWMutex
 	ttl     time.Duration
 }
 
-// newCache creates a new cache with the given TTL.
-func newCache(ttl time.Duration) *cache {
-	return &cache{
-		entries: make(map[string]cacheEntry),
-		ttl:     ttl,
-	}
-}
-
-// get retrieves a value from cache if not expired.
-func (c *cache) get(key string) (interface{}, bool) {
+// value retrieves a value from cache if not expired.
+func (c *cache) value(key string) (any, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
 	entry, exists := c.entries[key]
-	if !exists || time.Now().After(entry.expiration) {
+	c.mu.RUnlock()
+
+	if !exists {
 		return nil, false
 	}
-	
+
+	// Check expiration without holding the lock
+	if time.Now().After(entry.expiration) {
+		// Remove expired entry
+		c.mu.Lock()
+		delete(c.entries, key)
+		c.mu.Unlock()
+		return nil, false
+	}
+
 	return entry.value, true
 }
 
 // set stores a value in cache with TTL.
-func (c *cache) set(key string, value interface{}) {
+func (c *cache) set(key string, value any) {
+	c.setWithTTL(key, value, c.ttl)
+}
+
+// setWithTTL stores a value in cache with custom TTL.
+func (c *cache) setWithTTL(key string, value any, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	c.entries[key] = cacheEntry{
 		value:      value,
-		expiration: time.Now().Add(c.ttl),
+		expiration: time.Now().Add(ttl),
 	}
 }
 
-// clear removes all entries from cache.
-func (c *cache) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	c.entries = make(map[string]cacheEntry)
+// cleanupExpired periodically removes expired entries.
+func (c *cache) cleanupExpired() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now()
+		for key, entry := range c.entries {
+			if now.After(entry.expiration) {
+				delete(c.entries, key)
+			}
+		}
+		c.mu.Unlock()
+	}
 }

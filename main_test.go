@@ -112,20 +112,20 @@ func TestParsePRURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			owner, repo, num, err := parsePRURL(tt.url)
+			parts, err := parsePRURL(tt.url)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parsePRURL() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !tt.wantErr {
-				if owner != tt.wantOwner {
-					t.Errorf("parsePRURL() owner = %v, want %v", owner, tt.wantOwner)
+				if parts.Owner != tt.wantOwner {
+					t.Errorf("parsePRURL() owner = %v, want %v", parts.Owner, tt.wantOwner)
 				}
-				if repo != tt.wantRepo {
-					t.Errorf("parsePRURL() repo = %v, want %v", repo, tt.wantRepo)
+				if parts.Repo != tt.wantRepo {
+					t.Errorf("parsePRURL() repo = %v, want %v", parts.Repo, tt.wantRepo)
 				}
-				if num != tt.wantNum {
-					t.Errorf("parsePRURL() num = %v, want %v", num, tt.wantNum)
+				if parts.Number != tt.wantNum {
+					t.Errorf("parsePRURL() num = %v, want %v", parts.Number, tt.wantNum)
 				}
 			}
 		})
@@ -143,7 +143,7 @@ func TestGetChangedFiles(t *testing.T) {
 		},
 	}
 
-	files := rf.getChangedFiles(pr)
+	files := rf.changedFiles(pr)
 
 	// Should be sorted by total changes (largest first)
 	expected := []string{"large.go", "medium.go", "small.go"}
@@ -161,7 +161,7 @@ func TestGetChangedFiles(t *testing.T) {
 // TestParsePatchForChangedLines tests git patch parsing.
 func TestParsePatchForChangedLines(t *testing.T) {
 	rf := &ReviewerFinder{}
-	
+
 	tests := []struct {
 		name      string
 		patch     string
@@ -212,14 +212,14 @@ func TestParsePatchForChangedLines(t *testing.T) {
 // TestIsPRReady tests the PR age constraint logic.
 func TestIsPRReady(t *testing.T) {
 	now := time.Now()
-	
+
 	tests := []struct {
-		name         string
-		lastCommit   time.Time
-		lastReview   time.Time
-		minAge       time.Duration
-		maxAge       time.Duration
-		wantReady    bool
+		name       string
+		lastCommit time.Time
+		lastReview time.Time
+		minAge     time.Duration
+		maxAge     time.Duration
+		wantReady  bool
 	}{
 		{
 			name:       "PR within age range",
@@ -277,21 +277,21 @@ func TestIsPRReady(t *testing.T) {
 // TestFilterExistingReviewers tests filtering of already-assigned reviewers.
 func TestFilterExistingReviewers(t *testing.T) {
 	rf := &ReviewerFinder{}
-	
+
 	candidates := []ReviewerCandidate{
 		{Username: "alice"},
 		{Username: "bob"},
 		{Username: "charlie"},
 	}
-	
+
 	existing := []string{"bob"}
-	
+
 	filtered := rf.filterExistingReviewers(candidates, existing)
-	
+
 	if len(filtered) != 2 {
 		t.Errorf("filterExistingReviewers() returned %d candidates, want 2", len(filtered))
 	}
-	
+
 	// Check that bob was filtered out
 	for _, c := range filtered {
 		if c.Username == "bob" {
@@ -303,47 +303,27 @@ func TestFilterExistingReviewers(t *testing.T) {
 // TestGetDirectories tests directory extraction from file paths.
 func TestGetDirectories(t *testing.T) {
 	rf := &ReviewerFinder{}
-	
+
 	files := []string{
 		"src/main.go",
 		"src/lib/helper.go",
 		"test/main_test.go",
 		"README.md",
 	}
-	
-	dirs := rf.getDirectories(files)
-	
+
+	dirs := rf.directories(files)
+
 	// Should extract and sort by depth
 	expected := []string{"src/lib", "src", "test"}
-	
+
 	if len(dirs) != len(expected) {
 		t.Errorf("getDirectories() returned %d dirs, want %d", len(dirs), len(expected))
 		t.Errorf("got: %v", dirs)
 	}
-	
+
 	for i, want := range expected {
 		if i < len(dirs) && dirs[i] != want {
 			t.Errorf("getDirectories()[%d] = %v, want %v", i, dirs[i], want)
-		}
-	}
-}
-
-// TestAbs tests the absolute value function.
-func TestAbs(t *testing.T) {
-	tests := []struct {
-		input int
-		want  int
-	}{
-		{5, 5},
-		{-5, 5},
-		{0, 0},
-		{-100, 100},
-	}
-	
-	for _, tt := range tests {
-		got := abs(tt.input)
-		if got != tt.want {
-			t.Errorf("abs(%d) = %d, want %d", tt.input, got, tt.want)
 		}
 	}
 }
@@ -388,7 +368,7 @@ func TestAssigneePrioritization(t *testing.T) {
 				Author:    tt.prAuthor,
 				Assignees: tt.assignees,
 			}
-			
+
 			// Create a test that doesn't require API calls
 			// Just test the basic logic without the isValidReviewer check
 			expert := ""
@@ -400,7 +380,7 @@ func TestAssigneePrioritization(t *testing.T) {
 					}
 				}
 			}
-			
+
 			if expert != tt.wantExpert {
 				t.Errorf("assignee prioritization logic = %q, want %q", expert, tt.wantExpert)
 			}

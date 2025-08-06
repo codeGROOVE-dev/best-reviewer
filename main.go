@@ -1,7 +1,10 @@
+// Package main implements a tool for automatically finding and assigning
+// reviewers to GitHub pull requests based on code ownership and activity patterns.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -10,12 +13,12 @@ import (
 )
 
 var (
-	// Target flags (mutually exclusive)
+	// Target flags (mutually exclusive).
 	prURL   = flag.String("pr", "", "Pull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)")
 	project = flag.String("project", "", "GitHub project to monitor (e.g., owner/repo)")
 	org     = flag.String("org", "", "GitHub organization to monitor")
 
-	// Behavior flags
+	// Behavior flags.
 	poll        = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
 	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual approvals)")
 	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
@@ -23,6 +26,7 @@ var (
 )
 
 func main() {
+	setupUsage()
 	flag.Parse()
 
 	if err := validateFlags(); err != nil {
@@ -30,7 +34,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	client, err := newGitHubClient()
+	client, err := newGitHubClient(ctx)
 	if err != nil {
 		log.Fatalf("Failed to create GitHub client: %v", err)
 	}
@@ -40,7 +44,7 @@ func main() {
 		dryRun:      *dryRun,
 		minOpenTime: *minOpenTime,
 		maxOpenTime: *maxOpenTime,
-		output:      &outputFormatter{verbose: false},
+		output:      &outputFormatter{verbose: true},
 	}
 
 	if *poll > 0 {
@@ -67,26 +71,23 @@ func validateFlags() error {
 	}
 
 	if targetFlags != 1 {
-		return fmt.Errorf("exactly one of -pr, -project, or -org must be specified")
+		return errors.New("exactly one of -pr, -project, or -org must be specified")
 	}
 
 	return nil
 }
 
-// usage prints usage information.
-func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\nTarget flags (mutually exclusive):\n")
-	fmt.Fprintf(os.Stderr, "  -pr string\n")
-	fmt.Fprintf(os.Stderr, "    \tPull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)\n")
-	fmt.Fprintf(os.Stderr, "  -project string\n")
-	fmt.Fprintf(os.Stderr, "    \tGitHub project to monitor (e.g., owner/repo)\n")
-	fmt.Fprintf(os.Stderr, "  -org string\n")
-	fmt.Fprintf(os.Stderr, "    \tGitHub organization to monitor\n")
-	fmt.Fprintf(os.Stderr, "\nBehavior flags:\n")
-	flag.PrintDefaults()
-}
-
-func init() {
-	flag.Usage = usage
+func setupUsage() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n", os.Args[0])
+		fmt.Fprint(os.Stderr, "\nTarget flags (mutually exclusive):\n")
+		fmt.Fprint(os.Stderr, "  -pr string\n")
+		fmt.Fprint(os.Stderr, "    \tPull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)\n")
+		fmt.Fprint(os.Stderr, "  -project string\n")
+		fmt.Fprint(os.Stderr, "    \tGitHub project to monitor (e.g., owner/repo)\n")
+		fmt.Fprint(os.Stderr, "  -org string\n")
+		fmt.Fprint(os.Stderr, "    \tGitHub organization to monitor\n")
+		fmt.Fprint(os.Stderr, "\nBehavior flags:\n")
+		flag.PrintDefaults()
+	}
 }

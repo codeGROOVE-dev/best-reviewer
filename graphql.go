@@ -4,14 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
 // makeGraphQLRequest makes a GraphQL request to GitHub API.
-func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}) (map[string]interface{}, error) {
-	payload := map[string]interface{}{
+func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
+	// Extract query type for better debugging
+	queryType := extractGraphQLQueryType(query)
+	querySize := len(query)
+	
+	log.Printf("[API] Executing GraphQL query: %s (size: %d chars)", queryType, querySize)
+	if len(variables) > 0 {
+		log.Printf("[GRAPHQL] Variables: %+v", variables)
+	}
+	payload := map[string]any{
 		"query":     query,
 		"variables": variables,
 	}
@@ -21,7 +33,7 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 		return nil, fmt.Errorf("failed to marshal GraphQL request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GraphQL request: %w", err)
 	}
@@ -29,44 +41,64 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Retry logic for GraphQL requests
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		if i > 0 {
-			time.Sleep(time.Duration(retryDelay) * time.Second)
-		}
+	log.Printf("[GRAPHQL] Executing %s query", queryType)
+	start := time.Now()
 
+	var result map[string]any
+	err = retryWithBackoff(ctx, fmt.Sprintf("GraphQL %s query", queryType), func() error {
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			lastErr = err
-			continue
+			return fmt.Errorf("graphql request failed: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("[WARN] Failed to close response body: %v", err)
+			}
+		}()
 
-		var result map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode GraphQL response: %w", err)
-			continue
+		// Read the response body
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read response: %w", err)
+		}
+
+		// Check for HTTP errors
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("graphql request failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Parse the response
+		if err := json.Unmarshal(body, &result); err != nil {
+			return fmt.Errorf("failed to decode GraphQL response: %w", err)
 		}
 
 		// Check for GraphQL errors
 		if errors, ok := result["errors"]; ok {
-			lastErr = fmt.Errorf("GraphQL errors: %v", errors)
-			continue
+			return fmt.Errorf("graphql errors: %v", errors)
 		}
 
-		return result, nil
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, fmt.Errorf("GraphQL request failed after %d retries: %w", maxRetries, lastErr)
+	duration := time.Since(start)
+	log.Printf("[GRAPHQL] %s query completed successfully in %v", queryType, duration)
+	return result, nil
 }
 
-// getRecentPRsInDirectory finds recent PRs that modified files in a directory.
-func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, repo, directory string) ([]PRInfo, error) {
+// recentPRsInDirectory finds recent PRs that modified files in a directory.
+func (rf *ReviewerFinder) recentPRsInDirectory(ctx context.Context, owner, repo, directory string) ([]PRInfo, error) {
+	log.Printf("[API] Querying historical PRs that modified directory '%s' in %s/%s to find expert reviewers", directory, owner, repo)
 	// Check cache first
 	cacheKey := fmt.Sprintf("prs-dir:%s/%s:%s", owner, repo, directory)
-	if cached, found := rf.client.cache.get(cacheKey); found {
-		return cached.([]PRInfo), nil
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		log.Printf("[CACHE] Hit for key: %s", cacheKey)
+		if prs, ok := cached.([]PRInfo); ok {
+			return prs, nil
+		}
+		log.Printf("[WARN] Cache type assertion failed for key: %s", cacheKey)
 	}
 	query := `
 	query($owner: String!, $repo: String!, $path: String!) {
@@ -74,9 +106,9 @@ func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, re
 			defaultBranchRef {
 				target {
 					... on Commit {
-						history(first: 100, path: $path) {
+						history(first: 10, path: $path) {
 							nodes {
-								associatedPullRequests(first: 5) {
+								associatedPullRequests(first: 3) {
 									nodes {
 										number
 										merged
@@ -84,7 +116,7 @@ func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, re
 											login
 										}
 										mergedAt
-										reviews(first: 10, states: APPROVED) {
+										reviews(first: 5, states: APPROVED) {
 											nodes {
 												author {
 													login
@@ -101,7 +133,7 @@ func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, re
 		}
 	}`
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": owner,
 		"repo":  repo,
 		"path":  directory,
@@ -112,7 +144,6 @@ func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, re
 		return nil, fmt.Errorf("GraphQL request failed: %w", err)
 	}
 
-
 	prs, err := rf.parsePRsFromGraphQL(result)
 	if err == nil && len(prs) > 0 {
 		rf.client.cache.set(cacheKey, prs)
@@ -120,17 +151,22 @@ func (rf *ReviewerFinder) getRecentPRsInDirectory(ctx context.Context, owner, re
 	return prs, err
 }
 
-// getRecentPRsInProject finds recent merged PRs in the project.
-func (rf *ReviewerFinder) getRecentPRsInProject(ctx context.Context, owner, repo string) ([]PRInfo, error) {
+// recentPRsInProject finds recent merged PRs in the project.
+func (rf *ReviewerFinder) recentPRsInProject(ctx context.Context, owner, repo string) ([]PRInfo, error) {
+	log.Printf("[API] Querying recent merged PRs across entire project %s/%s to build reviewer activity and expertise profiles", owner, repo)
 	// Check cache first
 	cacheKey := fmt.Sprintf("prs-project:%s/%s", owner, repo)
-	if cached, found := rf.client.cache.get(cacheKey); found {
-		return cached.([]PRInfo), nil
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		log.Printf("[CACHE] Hit for key: %s", cacheKey)
+		if prs, ok := cached.([]PRInfo); ok {
+			return prs, nil
+		}
+		log.Printf("[WARN] Cache type assertion failed for key: %s", cacheKey)
 	}
 	query := `
 	query($owner: String!, $repo: String!) {
 		repository(owner: $owner, name: $repo) {
-			pullRequests(first: 20, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+			pullRequests(first: 3, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
 				nodes {
 					number
 					author {
@@ -149,7 +185,7 @@ func (rf *ReviewerFinder) getRecentPRsInProject(ctx context.Context, owner, repo
 		}
 	}`
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": owner,
 		"repo":  repo,
 	}
@@ -166,21 +202,26 @@ func (rf *ReviewerFinder) getRecentPRsInProject(ctx context.Context, owner, repo
 	return prs, err
 }
 
-// getHistoricalPRsForFile finds merged PRs that modified a specific file.
-func (rf *ReviewerFinder) getHistoricalPRsForFile(ctx context.Context, owner, repo, filepath string, limit int) ([]PRInfo, error) {
+// historicalPRsForFile finds merged PRs that modified a specific file.
+func (rf *ReviewerFinder) historicalPRsForFile(ctx context.Context, owner, repo, filepath string, limit int) ([]PRInfo, error) {
+	log.Printf("[API] Querying historical PRs that modified file '%s' in %s/%s to identify expert reviewers", filepath, owner, repo)
 	// Check cache first
 	cacheKey := fmt.Sprintf("prs-file:%s/%s:%s:%d", owner, repo, filepath, limit)
-	if cached, found := rf.client.cache.get(cacheKey); found {
-		return cached.([]PRInfo), nil
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		log.Printf("[CACHE] Hit for key: %s", cacheKey)
+		if prs, ok := cached.([]PRInfo); ok {
+			return prs, nil
+		}
+		log.Printf("[WARN] Cache type assertion failed for key: %s", cacheKey)
 	}
-	
+
 	query := `
 	query($owner: String!, $repo: String!, $path: String!) {
 		repository(owner: $owner, name: $repo) {
 			defaultBranchRef {
 				target {
 					... on Commit {
-						history(first: 100, path: $path) {
+						history(first: 10, path: $path) {
 							nodes {
 								oid
 								author {
@@ -197,14 +238,14 @@ func (rf *ReviewerFinder) getHistoricalPRsForFile(ctx context.Context, owner, re
 											login
 										}
 										mergedAt
-										reviews(first: 10, states: APPROVED) {
+										reviews(first: 5, states: APPROVED) {
 											nodes {
 												author {
 													login
 												}
 											}
 										}
-										files(first: 100) {
+										files(first: 50) {
 											nodes {
 												path
 											}
@@ -219,7 +260,7 @@ func (rf *ReviewerFinder) getHistoricalPRsForFile(ctx context.Context, owner, re
 		}
 	}`
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": owner,
 		"repo":  repo,
 		"path":  filepath,
@@ -238,60 +279,60 @@ func (rf *ReviewerFinder) getHistoricalPRsForFile(ctx context.Context, owner, re
 }
 
 // parsePRsFromGraphQL extracts PR info from GraphQL response.
-func (rf *ReviewerFinder) parsePRsFromGraphQL(result map[string]interface{}) ([]PRInfo, error) {
+func (*ReviewerFinder) parsePRsFromGraphQL(result map[string]any) ([]PRInfo, error) {
 	var prs []PRInfo
-	
+
 	// Navigate through the GraphQL response structure
-	data, ok := getMap(result, "data")
+	data, ok := mapValue(result, "data")
 	if !ok {
-		return nil, fmt.Errorf("invalid GraphQL response format")
+		return nil, errors.New("invalid GraphQL response format")
 	}
 
-	repository, ok := getMap(data, "repository")
+	repository, ok := mapValue(data, "repository")
 	if !ok {
-		return nil, fmt.Errorf("repository not found in response")
+		return nil, errors.New("repository not found in response")
 	}
 
-	defaultBranchRef, ok := getMap(repository, "defaultBranchRef")
+	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
 	if !ok {
-		return nil, fmt.Errorf("defaultBranchRef not found")
+		return nil, errors.New("defaultBranchRef not found")
 	}
 
-	target, ok := getMap(defaultBranchRef, "target")
+	target, ok := mapValue(defaultBranchRef, "target")
 	if !ok {
-		return nil, fmt.Errorf("target not found")
+		return nil, errors.New("target not found")
 	}
 
-	history, ok := getMap(target, "history")
+	history, ok := mapValue(target, "history")
 	if !ok {
-		return nil, fmt.Errorf("history not found")
+		return nil, errors.New("history not found")
 	}
 
-	nodes, ok := getSlice(history, "nodes")
+	nodes, ok := nodesValue(history)
 	if !ok {
-		return nil, fmt.Errorf("nodes not found")
+		return nil, errors.New("nodes not found")
 	}
 
 	// Process commits and their associated PRs
 	seen := make(map[int]bool)
 	for _, node := range nodes {
-		commit, ok := node.(map[string]interface{})
+		commit, ok := node.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		associatedPRs, ok := getMap(commit, "associatedPullRequests")
+		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
 		if !ok {
 			continue
 		}
 
-		prNodes, ok := getSlice(associatedPRs, "nodes")
+		prNodes, ok := nodesValue(associatedPRs)
 		if !ok {
 			continue
 		}
 
 		for _, prNode := range prNodes {
-			pr, ok := prNode.(map[string]interface{})
+			pr, ok := prNode.(map[string]any)
 			if !ok {
 				continue
 			}
@@ -308,31 +349,31 @@ func (rf *ReviewerFinder) parsePRsFromGraphQL(result map[string]interface{}) ([]
 }
 
 // parseProjectPRsFromGraphQL extracts PR info from project-wide GraphQL response.
-func (rf *ReviewerFinder) parseProjectPRsFromGraphQL(result map[string]interface{}) ([]PRInfo, error) {
+func (*ReviewerFinder) parseProjectPRsFromGraphQL(result map[string]any) ([]PRInfo, error) {
 	var prs []PRInfo
-	
-	data, ok := getMap(result, "data")
+
+	data, ok := mapValue(result, "data")
 	if !ok {
-		return nil, fmt.Errorf("invalid GraphQL response format")
+		return nil, errors.New("invalid GraphQL response format")
 	}
 
-	repository, ok := getMap(data, "repository")
+	repository, ok := mapValue(data, "repository")
 	if !ok {
-		return nil, fmt.Errorf("repository not found in response")
+		return nil, errors.New("repository not found in response")
 	}
 
-	pullRequests, ok := getMap(repository, "pullRequests")
+	pullRequests, ok := mapValue(repository, "pullRequests")
 	if !ok {
-		return nil, fmt.Errorf("pullRequests not found")
+		return nil, errors.New("pullRequests not found")
 	}
 
-	nodes, ok := getSlice(pullRequests, "nodes")
+	nodes, ok := nodesValue(pullRequests)
 	if !ok {
-		return nil, fmt.Errorf("nodes not found")
+		return nil, errors.New("nodes not found")
 	}
 
 	for _, node := range nodes {
-		pr, ok := node.(map[string]interface{})
+		pr, ok := node.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -340,7 +381,7 @@ func (rf *ReviewerFinder) parseProjectPRsFromGraphQL(result map[string]interface
 		prInfo := parsePRNode(pr)
 		if prInfo != nil {
 			prs = append(prs, *prInfo)
-			
+
 			// Short-circuit if we reach old PRs
 		}
 	}
@@ -349,82 +390,82 @@ func (rf *ReviewerFinder) parseProjectPRsFromGraphQL(result map[string]interface
 }
 
 // parseHistoricalPRsFromGraphQL extracts PR info from historical file query.
-func (rf *ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]interface{}, targetFile string) ([]PRInfo, error) {
+func (*ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]any, targetFile string) ([]PRInfo, error) {
 	var prs []PRInfo
 	seen := make(map[int]bool)
-	
+
 	// Navigate through response (similar structure as parsePRsFromGraphQL)
-	data, ok := getMap(result, "data")
+	data, ok := mapValue(result, "data")
 	if !ok {
-		return nil, fmt.Errorf("invalid GraphQL response format")
+		return nil, errors.New("invalid GraphQL response format")
 	}
 
-	repository, ok := getMap(data, "repository")
+	repository, ok := mapValue(data, "repository")
 	if !ok {
-		return nil, fmt.Errorf("repository not found in response")
+		return nil, errors.New("repository not found in response")
 	}
 
-	defaultBranchRef, ok := getMap(repository, "defaultBranchRef")
+	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
 	if !ok {
-		return nil, fmt.Errorf("defaultBranchRef not found")
+		return nil, errors.New("defaultBranchRef not found")
 	}
 
-	target, ok := getMap(defaultBranchRef, "target")
+	target, ok := mapValue(defaultBranchRef, "target")
 	if !ok {
-		return nil, fmt.Errorf("target not found")
+		return nil, errors.New("target not found")
 	}
 
-	history, ok := getMap(target, "history")
+	history, ok := mapValue(target, "history")
 	if !ok {
-		return nil, fmt.Errorf("history not found")
+		return nil, errors.New("history not found")
 	}
 
-	nodes, ok := getSlice(history, "nodes")
+	nodes, ok := nodesValue(history)
 	if !ok {
-		return nil, fmt.Errorf("nodes not found")
+		return nil, errors.New("nodes not found")
 	}
 
 	// Process commits
 	for _, node := range nodes {
-		commit, ok := node.(map[string]interface{})
+		commit, ok := node.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		associatedPRs, ok := getMap(commit, "associatedPullRequests")
+		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
 		if !ok {
 			continue
 		}
 
-		prNodes, ok := getSlice(associatedPRs, "nodes")
+		prNodes, ok := nodesValue(associatedPRs)
 		if !ok || len(prNodes) == 0 {
 			continue
 		}
 
 		for _, prNode := range prNodes {
-			pr, ok := prNode.(map[string]interface{})
+			pr, ok := prNode.(map[string]any)
 			if !ok {
 				continue
 			}
 
 			// Verify this PR actually touched our target file
-			files, ok := getMap(pr, "files")
+			files, ok := mapValue(pr, "files")
 			if !ok {
 				continue
 			}
 
-			fileNodes, ok := getSlice(files, "nodes")
+			fileNodes, ok := nodesValue(files)
 			if !ok {
 				continue
 			}
 
 			fileFound := false
 			for _, fileNode := range fileNodes {
-				file, ok := fileNode.(map[string]interface{})
+				file, ok := fileNode.(map[string]any)
 				if !ok {
 					continue
 				}
-				if path, ok := getString(file, "path"); ok && path == targetFile {
+				if path, ok := stringValue(file, "path"); ok && path == targetFile {
 					fileFound = true
 					break
 				}
@@ -445,27 +486,31 @@ func (rf *ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]interf
 	return prs, nil
 }
 
-// Helper functions for navigating GraphQL responses
+// Helper functions for navigating GraphQL responses.
 
-func getMap(data map[string]interface{}, key string) (map[string]interface{}, bool) {
+func mapValue(data map[string]any, key string) (map[string]any, bool) {
 	val, ok := data[key]
 	if !ok {
 		return nil, false
 	}
-	m, ok := val.(map[string]interface{})
+	m, ok := val.(map[string]any)
 	return m, ok
 }
 
-func getSlice(data map[string]interface{}, key string) ([]interface{}, bool) {
+func sliceValue(data map[string]any, key string) ([]any, bool) {
 	val, ok := data[key]
 	if !ok {
 		return nil, false
 	}
-	s, ok := val.([]interface{})
+	s, ok := val.([]any)
 	return s, ok
 }
 
-func getString(data map[string]interface{}, key string) (string, bool) {
+func nodesValue(data map[string]any) ([]any, bool) {
+	return sliceValue(data, graphQLNodes)
+}
+
+func stringValue(data map[string]any, key string) (string, bool) {
 	val, ok := data[key]
 	if !ok {
 		return "", false
@@ -474,7 +519,7 @@ func getString(data map[string]interface{}, key string) (string, bool) {
 	return s, ok
 }
 
-func getFloat(data map[string]interface{}, key string) (float64, bool) {
+func floatValue(data map[string]any, key string) (float64, bool) {
 	val, ok := data[key]
 	if !ok {
 		return 0, false
@@ -483,14 +528,14 @@ func getFloat(data map[string]interface{}, key string) (float64, bool) {
 	return f, ok
 }
 
-func parsePRNode(pr map[string]interface{}) *PRInfo {
+func parsePRNode(pr map[string]any) *PRInfo {
 	// Skip if not merged
 	merged, ok := pr["merged"].(bool)
 	if !ok || !merged {
 		return nil
 	}
 
-	number, ok := getFloat(pr, "number")
+	number, ok := floatValue(pr, "number")
 	if !ok {
 		return nil
 	}
@@ -498,43 +543,112 @@ func parsePRNode(pr map[string]interface{}) *PRInfo {
 	prInfo := &PRInfo{Number: int(number)}
 
 	// Get author
-	if author, ok := getMap(pr, "author"); ok {
-		if login, ok := getString(author, "login"); ok {
+	if author, ok := mapValue(pr, "author"); ok {
+		if login, ok := stringValue(author, "login"); ok {
 			prInfo.Author = login
 		}
 	}
 
 	// Get merged time
-	if mergedAt, ok := getString(pr, "mergedAt"); ok {
+	if mergedAt, ok := stringValue(pr, "mergedAt"); ok {
 		if t, err := time.Parse(time.RFC3339, mergedAt); err == nil {
 			prInfo.MergedAt = t
 		}
 	}
 
 	// Get reviewers
-	if reviews, ok := getMap(pr, "reviews"); ok {
-		if reviewNodes, ok := getSlice(reviews, "nodes"); ok {
-			for _, reviewNode := range reviewNodes {
-				if review, ok := reviewNode.(map[string]interface{}); ok {
-					if author, ok := getMap(review, "author"); ok {
-						if login, ok := getString(author, "login"); ok {
-							// Avoid duplicates
-							found := false
-							for _, r := range prInfo.Reviewers {
-								if r == login {
-									found = true
-									break
-								}
-							}
-							if !found {
-								prInfo.Reviewers = append(prInfo.Reviewers, login)
-							}
-						}
+	prInfo.Reviewers = extractReviewers(pr)
+
+	return prInfo
+}
+
+// extractReviewers extracts unique reviewer logins from a PR node.
+func extractReviewers(pr map[string]any) []string {
+	var reviewers []string
+	seen := make(map[string]bool)
+
+	reviews, ok := mapValue(pr, "reviews")
+	if !ok {
+		return reviewers
+	}
+
+	reviewNodes, ok := nodesValue(reviews)
+	if !ok {
+		return reviewers
+	}
+
+	for _, reviewNode := range reviewNodes {
+		review, ok := reviewNode.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		author, ok := mapValue(review, "author")
+		if !ok {
+			continue
+		}
+
+		login, ok := stringValue(author, "login")
+		if !ok || seen[login] {
+			continue
+		}
+
+		seen[login] = true
+		reviewers = append(reviewers, login)
+	}
+
+	return reviewers
+}
+
+// extractGraphQLQueryType extracts a descriptive query type from GraphQL query for debugging.
+func extractGraphQLQueryType(query string) string {
+	query = strings.TrimSpace(query)
+	lines := strings.Split(query, "\n")
+	
+	// Look for the main query pattern
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "query(") {
+			// Extract the first field being queried
+			for i := 1; i < len(lines); i++ {
+				fieldLine := strings.TrimSpace(lines[i])
+				if fieldLine != "" && !strings.HasPrefix(fieldLine, "}") {
+					// Remove common prefixes and extract main object
+					if strings.Contains(fieldLine, "organization(") {
+						return "organization-repositories"
 					}
+					if strings.Contains(fieldLine, "repository(") {
+						if strings.Contains(query, "pullRequests") {
+							if strings.Contains(query, "history") {
+								return "repository-commit-history"
+							}
+							return "repository-pullrequests"
+						}
+						return "repository-query"
+					}
+					// Extract the main field name
+					if idx := strings.Index(fieldLine, "("); idx != -1 {
+						return strings.TrimSpace(fieldLine[:idx])
+					}
+					if idx := strings.Index(fieldLine, " "); idx != -1 {
+						return strings.TrimSpace(fieldLine[:idx])
+					}
+					return fieldLine
 				}
 			}
 		}
 	}
-
-	return prInfo
+	
+	// Fallback to detecting by content
+	if strings.Contains(query, "organization") && strings.Contains(query, "repositories") {
+		return "org-batch-prs"
+	}
+	if strings.Contains(query, "repository") && strings.Contains(query, "pullRequests") {
+		return "repo-recent-prs"
+	}
+	if strings.Contains(query, "history") {
+		return "commit-history"
+	}
+	
+	return "unknown-graphql"
 }

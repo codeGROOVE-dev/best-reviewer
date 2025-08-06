@@ -11,19 +11,19 @@ type outputFormatter struct {
 }
 
 // formatPRHeader formats the PR information header.
-func (of *outputFormatter) formatPRHeader(pr *PullRequest) string {
+func (*outputFormatter) formatPRHeader(pr *PullRequest) string {
 	var b strings.Builder
-	
+
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 	b.WriteString(fmt.Sprintf("  PR #%d: %s\n", pr.Number, pr.Title))
 	b.WriteString(fmt.Sprintf("  Author: @%s | State: %s", pr.Author, pr.State))
 	if pr.Draft {
 		b.WriteString(" [DRAFT]")
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
-	
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
 	return b.String()
 }
 
@@ -32,25 +32,25 @@ func (of *outputFormatter) formatCandidates(candidates []ReviewerCandidate, exis
 	if len(candidates) == 0 {
 		return "\n  ⚠️  No suitable reviewers found\n"
 	}
-	
+
 	var b strings.Builder
 	b.WriteString("\n  🎯 Reviewer Recommendations:\n\n")
-	
+
 	// Format each candidate
 	for i, candidate := range candidates {
 		rank := i + 1
-		icon := of.getMethodIcon(candidate.SelectionMethod)
-		
+		icon := of.methodIcon(candidate.SelectionMethod)
+
 		b.WriteString(fmt.Sprintf("  %d. %s @%s\n", rank, icon, candidate.Username))
-		b.WriteString(fmt.Sprintf("     └─ %s (score: %d)\n", 
-			of.formatMethod(candidate.SelectionMethod), 
+		b.WriteString(fmt.Sprintf("     └─ %s (score: %d)\n",
+			of.formatMethod(candidate.SelectionMethod),
 			candidate.ContextScore))
-		
+
 		if i < len(candidates)-1 {
 			b.WriteString("\n")
 		}
 	}
-	
+
 	// Show existing reviewers if any
 	if len(existing) > 0 {
 		b.WriteString("\n  📋 Current Reviewers: ")
@@ -62,14 +62,14 @@ func (of *outputFormatter) formatCandidates(candidates []ReviewerCandidate, exis
 		}
 		b.WriteString("\n")
 	}
-	
+
 	return b.String()
 }
 
 // formatAction formats the action taken.
-func (of *outputFormatter) formatAction(action string, pr *PullRequest, reviewers []string) string {
+func (*outputFormatter) formatAction(action string, pr *PullRequest, reviewers []string) string {
 	var b strings.Builder
-	
+
 	switch action {
 	case "assigned":
 		b.WriteString(fmt.Sprintf("\n  ✅ Assigned reviewers to PR #%d: ", pr.Number))
@@ -89,16 +89,18 @@ func (of *outputFormatter) formatAction(action string, pr *PullRequest, reviewer
 		}
 	case "skipped":
 		b.WriteString(fmt.Sprintf("\n  ⏭️  Skipped PR #%d (already has reviewers)", pr.Number))
+	default:
+		b.WriteString(fmt.Sprintf("\n  ❓ Unknown action for PR #%d", pr.Number))
 	}
-	
+
 	b.WriteString("\n")
 	return b.String()
 }
 
 // formatSummary formats the final summary.
-func (of *outputFormatter) formatSummary(processed, assigned, skipped int) string {
+func (*outputFormatter) formatSummary(processed, assigned, skipped int) string {
 	var b strings.Builder
-	
+
 	b.WriteString("\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 	b.WriteString("  📊 Summary\n")
@@ -107,12 +109,12 @@ func (of *outputFormatter) formatSummary(processed, assigned, skipped int) strin
 	b.WriteString(fmt.Sprintf("  • Assigned:  %d PRs\n", assigned))
 	b.WriteString(fmt.Sprintf("  • Skipped:   %d PRs\n", skipped))
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-	
+
 	return b.String()
 }
 
-// getMethodIcon returns an icon for the selection method.
-func (of *outputFormatter) getMethodIcon(method string) string {
+// methodIcon returns an icon for the selection method.
+func (*outputFormatter) methodIcon(method string) string {
 	switch method {
 	case selectionAssignee:
 		return "👤"
@@ -136,7 +138,7 @@ func (of *outputFormatter) getMethodIcon(method string) string {
 }
 
 // formatMethod formats the selection method description.
-func (of *outputFormatter) formatMethod(method string) string {
+func (*outputFormatter) formatMethod(method string) string {
 	switch method {
 	case selectionAssignee:
 		return "PR assignee (highest priority)"
@@ -157,28 +159,4 @@ func (of *outputFormatter) formatMethod(method string) string {
 	default:
 		return method
 	}
-}
-
-// progressBar creates a simple progress indicator.
-func (of *outputFormatter) progressBar(current, total int) string {
-	if total == 0 {
-		return ""
-	}
-	
-	width := 40
-	filled := (current * width) / total
-	
-	var bar strings.Builder
-	bar.WriteString("  [")
-	for i := 0; i < width; i++ {
-		if i < filled {
-			bar.WriteString("█")
-		} else {
-			bar.WriteString("░")
-		}
-	}
-	bar.WriteString("] ")
-	bar.WriteString(fmt.Sprintf("%d/%d", current, total))
-	
-	return bar.String()
 }

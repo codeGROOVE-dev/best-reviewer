@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"testing"
 )
 
@@ -21,7 +22,7 @@ func TestIsUserBot(t *testing.T) {
 		{"Bot with bot- prefix", "bot-user", true},
 		{"Bot with bot_ prefix", "bot_scanner", true},
 		{"Bot with .bot suffix", "scanner.bot", true},
-		
+
 		// Specific known bots
 		{"GitHub Actions", "github-actions", true},
 		{"GitHub Actions with bracket", "github-actions[bot]", true},
@@ -35,7 +36,7 @@ func TestIsUserBot(t *testing.T) {
 		{"Jenkins", "jenkins", true},
 		{"Mergify", "mergify[bot]", true},
 		{"Stale bot", "stale[bot]", true},
-		
+
 		// Organization/service patterns
 		{"Octo STS", "octo-sts", true},
 		{"Octocat", "octocat", true},
@@ -53,7 +54,7 @@ func TestIsUserBot(t *testing.T) {
 		{"Admin account", "cluster-admin", true},
 		{"Security account", "security-scanner", true},
 		{"Compliance account", "compliance-checker", true},
-		
+
 		// Valid human users
 		{"Regular user", "johndoe", false},
 		{"User with dash", "john-doe", false},
@@ -64,7 +65,7 @@ func TestIsUserBot(t *testing.T) {
 		{"PR author", "ajayk", false},
 		{"Reviewer", "tstromberg", false},
 		{"Another reviewer", "vavilen84", false},
-		
+
 		// Edge cases - users that might look like bots but aren't
 		{"User with 'bot' in name", "abbott", false},
 		{"User with 'test' in name", "atestuser", false},
@@ -87,23 +88,27 @@ func TestIsUserBot(t *testing.T) {
 func TestIsValidReviewer(t *testing.T) {
 	// Create a mock GitHub client that returns specific user types
 	mockClient := &GitHubClient{
-		userCache: newUserCache(),
+		httpClient: &http.Client{},
+		userCache:  &userCache{users: make(map[string]*userInfo)},
+		token:      "test-token",
 	}
-	
+
 	// Pre-populate the cache with test data
 	mockClient.userCache.users["octo-sts"] = &userInfo{login: "octo-sts", userType: userTypeOrg}
 	mockClient.userCache.users["github"] = &userInfo{login: "github", userType: userTypeOrg}
 	mockClient.userCache.users["dependabot[bot]"] = &userInfo{login: "dependabot[bot]", userType: userTypeBot}
+	mockClient.userCache.users["github-actions"] = &userInfo{login: "github-actions", userType: userTypeBot}
+	mockClient.userCache.users["deploy-service"] = &userInfo{login: "deploy-service", userType: userTypeBot}
 	mockClient.userCache.users["johndoe"] = &userInfo{login: "johndoe", userType: userTypeUser}
 	mockClient.userCache.users["sergiodj"] = &userInfo{login: "sergiodj", userType: userTypeUser}
-	
+
 	rf := &ReviewerFinder{
 		client: mockClient,
 	}
-	
+
 	ctx := context.Background()
 	pr := &PullRequest{Owner: "test", Repository: "repo"}
-	
+
 	tests := []struct {
 		name      string
 		username  string
@@ -115,12 +120,12 @@ func TestIsValidReviewer(t *testing.T) {
 		{"Bot with API confirmation", "dependabot[bot]", false},
 		{"Pattern-based bot", "github-actions", false},
 		{"Service account", "deploy-service", false},
-		
+
 		// Should be valid
 		{"Regular user", "johndoe", true},
 		{"Contributor", "sergiodj", true},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := rf.isValidReviewer(ctx, pr, tt.username)
@@ -159,7 +164,7 @@ func TestGetUserType(t *testing.T) {
 			wantUserType: userTypeUser,
 		},
 	}
-	
+
 	// These would be integration tests with a mock HTTP client
 	// For now, we're testing the core logic
 	for _, tt := range tests {
