@@ -18,7 +18,7 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 	// Extract query type for better debugging
 	queryType := extractGraphQLQueryType(query)
 	querySize := len(query)
-	
+
 	log.Printf("[API] Executing GraphQL query: %s (size: %d chars)", queryType, querySize)
 	if len(variables) > 0 {
 		log.Printf("[GRAPHQL] Variables: %+v", variables)
@@ -604,7 +604,7 @@ func extractReviewers(pr map[string]any) []string {
 func extractGraphQLQueryType(query string) string {
 	query = strings.TrimSpace(query)
 	lines := strings.Split(query, "\n")
-	
+
 	// Look for the main query pattern
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -638,7 +638,7 @@ func extractGraphQLQueryType(query string) string {
 			}
 		}
 	}
-	
+
 	// Fallback to detecting by content
 	if strings.Contains(query, "organization") && strings.Contains(query, "repositories") {
 		return "org-batch-prs"
@@ -649,6 +649,6 @@ func extractGraphQLQueryType(query string) string {
 	if strings.Contains(query, "history") {
 		return "commit-history"
 	}
-	
+
 	return "unknown-graphql"
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
@@ -94,11 +95,11 @@ func newGitHubClient(ctx context.Context) (*GitHubClient, error) {
 }
 
 // makeRequest makes an HTTP request to the GitHub API with retry logic.
-func (c *GitHubClient) makeRequest(ctx context.Context, method, url string, body any) (*http.Response, error) {
-	log.Printf("[HTTP] %s %s", method, url)
+func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
+	log.Printf("[HTTP] %s %s", method, apiURL)
 
 	var resp *http.Response
-	err := retryWithBackoff(ctx, fmt.Sprintf("%s %s", method, url), func() error {
+	err := retryWithBackoff(ctx, fmt.Sprintf("%s %s", method, apiURL), func() error {
 		var bodyReader io.Reader
 		if body != nil {
 			bodyBytes, err := json.Marshal(body)
@@ -108,7 +109,7 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, url string, body
 			bodyReader = bytes.NewReader(bodyBytes)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		req, err := http.NewRequestWithContext(ctx, method, apiURL, bodyReader)
 		if err != nil {
 			return fmt.Errorf("failed to create request: %w", err)
 		}
@@ -149,7 +150,7 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, url string, body
 		return nil, err
 	}
 
-	log.Printf("[HTTP] %s %s - Status: %d", method, url, resp.StatusCode)
+	log.Printf("[HTTP] %s %s - Status: %d", method, apiURL, resp.StatusCode)
 	return resp, nil
 }
 
@@ -168,8 +169,8 @@ func (c *GitHubClient) pullRequestWithUpdatedAt(
 	}
 
 	log.Printf("[API] Fetching PR details for %s/%s#%d to get title, state, author, assignees, reviewers, and metadata", owner, repo, prNumber)
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, prNumber)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -282,11 +283,11 @@ func (c *GitHubClient) openPullRequests(ctx context.Context, owner, repo string)
 
 	for {
 		log.Printf("[API] Requesting page %d of open PRs for %s/%s (pagination)", page, owner, repo)
-		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls?state=open&per_page=100&page=%d", owner, repo, page)
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls?state=open&per_page=100&page=%d", owner, repo, page)
 
 		// Extract API call to avoid defer in loop
 		prs, shouldBreak, err := func() ([]json.RawMessage, bool, error) {
-			resp, err := c.makeRequest(ctx, "GET", url, nil)
+			resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 			if err != nil {
 				return nil, false, err
 			}
@@ -344,8 +345,8 @@ func (c *GitHubClient) openPullRequests(ctx context.Context, owner, repo string)
 // changedFiles fetches the list of changed files in a PR.
 func (c *GitHubClient) changedFiles(ctx context.Context, owner, repo string, prNumber int) ([]ChangedFile, error) {
 	log.Printf("[API] Fetching changed files for PR %s/%s#%d to determine modified files for reviewer expertise matching", owner, repo, prNumber)
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -382,8 +383,8 @@ func (c *GitHubClient) changedFiles(ctx context.Context, owner, repo string, prN
 // lastCommitTime returns the timestamp of the last commit.
 func (c *GitHubClient) lastCommitTime(ctx context.Context, owner, repo, sha string) (time.Time, error) {
 	log.Printf("[API] Fetching commit details for %s/%s@%s to get last commit timestamp for PR staleness analysis", owner, repo, sha)
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", owner, repo, sha)
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", owner, repo, sha)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -411,8 +412,8 @@ func (c *GitHubClient) lastCommitTime(ctx context.Context, owner, repo, sha stri
 // lastReviewTime returns the timestamp of the last review.
 func (c *GitHubClient) lastReviewTime(ctx context.Context, owner, repo string, prNumber int) (time.Time, error) {
 	log.Printf("[API] Fetching review history for PR %s/%s#%d to determine last review timestamp for staleness detection", owner, repo, prNumber)
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -563,4 +564,103 @@ func (*ReviewerFinder) hasWriteAccess(ctx context.Context, _ string, _ string, _
 	// For simplicity, assume all users have write access
 	// In production, this would check collaborator status
 	return true
+}
+
+// openPRCount returns the number of open PRs assigned to or requested for review by a user in an organization.
+func (c *GitHubClient) openPRCount(ctx context.Context, org, user string, cacheTTL time.Duration) (int, error) {
+	// Check cache first for successful results
+	cacheKey := makeCacheKey("pr-count", org, user)
+	if cached, found := c.cache.value(cacheKey); found {
+		if count, ok := cached.(int); ok {
+			log.Printf("    [CACHE] User %s has %d non-stale open PRs in org %s (cached)", user, count, org)
+			return count, nil
+		}
+	}
+
+	// Check if we recently failed to get PR count for this user to avoid repeated failures
+	failureKey := makeCacheKey("pr-count-failure", org, user)
+	if _, found := c.cache.value(failureKey); found {
+		return 0, errors.New("recently failed to get PR count (cached failure)")
+	}
+
+	// Validate that the organization and user are not empty
+	if org == "" || user == "" {
+		return 0, fmt.Errorf("invalid organization (%s) or user (%s)", org, user)
+	}
+
+	log.Printf("  [API] Fetching open PR count for user %s in org %s", user, org)
+
+	// Create a context with shorter timeout for PR count queries to avoid hanging
+	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Calculate the cutoff date for non-stale PRs (90 days ago)
+	cutoffDate := time.Now().AddDate(0, 0, -prStaleDaysThreshold).Format("2006-01-02")
+
+	// Use two separate queries as they are simpler and more reliable
+	// Only count PRs updated within the last 90 days to exclude stale PRs
+	// First, search for PRs where user is assigned
+	assignedQuery := fmt.Sprintf("is:pr is:open org:%s assignee:%s updated:>=%s", org, user, cutoffDate)
+	log.Printf("  [DEBUG] Searching assigned PRs for %s (updated since %s)", user, cutoffDate)
+	assignedCount, err := c.searchPRCount(timeoutCtx, assignedQuery)
+	if err != nil {
+		// Cache the failure to avoid repeated attempts
+		c.cache.setWithTTL(failureKey, true, prCountFailureCacheTTL)
+		return 0, fmt.Errorf("failed to get assigned PR count: %w", err)
+	}
+	log.Printf("  [DEBUG] Found %d non-stale assigned PRs for %s", assignedCount, user)
+
+	// Second, search for PRs where user is requested as reviewer
+	reviewQuery := fmt.Sprintf("is:pr is:open org:%s review-requested:%s updated:>=%s", org, user, cutoffDate)
+	log.Printf("  [DEBUG] Searching review-requested PRs for %s (updated since %s)", user, cutoffDate)
+	reviewCount, err := c.searchPRCount(timeoutCtx, reviewQuery)
+	if err != nil {
+		// Cache the failure to avoid repeated attempts
+		c.cache.setWithTTL(failureKey, true, prCountFailureCacheTTL)
+		return 0, fmt.Errorf("failed to get review-requested PR count: %w", err)
+	}
+	log.Printf("  [DEBUG] Found %d non-stale review-requested PRs for %s", reviewCount, user)
+
+	total := assignedCount + reviewCount
+
+	log.Printf("    📊 User %s has %d non-stale open PRs in org %s (%d assigned, %d for review)", user, total, org, assignedCount, reviewCount)
+
+	// Cache the successful result
+	c.cache.setWithTTL(cacheKey, total, cacheTTL)
+
+	return total, nil
+}
+
+// searchPRCount searches for PRs matching a query and returns the count.
+func (c *GitHubClient) searchPRCount(ctx context.Context, query string) (int, error) {
+	encodedQuery := url.QueryEscape(query)
+	apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=1", encodedQuery)
+	log.Printf("  [DEBUG] Search query: %s", query)
+	log.Printf("  [DEBUG] Full URL: %s", apiURL)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusForbidden {
+		return 0, fmt.Errorf("search API rate limit exceeded (status %d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("search failed (status %d)", resp.StatusCode)
+	}
+
+	var searchResult struct {
+		TotalCount int `json:"total_count"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&searchResult); err != nil {
+		return 0, fmt.Errorf("failed to decode search result: %w", err)
+	}
+
+	return searchResult.TotalCount, nil
 }

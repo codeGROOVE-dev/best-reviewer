@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"time"
 
 	"github.com/codeGROOVE-dev/retry"
 )
@@ -13,12 +12,12 @@ func retryWithBackoff(ctx context.Context, operation string, fn func() error) er
 	return retry.Do(
 		fn,
 		retry.Context(ctx),
-		retry.Attempts(5),
+		retry.Attempts(maxRetryAttempts),
 		retry.DelayType(retry.BackOffDelay),
-		retry.Delay(time.Second),
-		retry.MaxDelay(2*time.Minute),
+		retry.Delay(initialRetryDelay),
+		retry.MaxDelay(maxRetryDelay),
 		retry.OnRetry(func(n uint, err error) {
-			log.Printf("[RETRY] %s: attempt %d/5 failed: %v", operation, n+1, err)
+			log.Printf("[RETRY] %s: attempt %d/%d failed: %v", operation, n+1, maxRetryAttempts, err)
 		}),
 		retry.LastErrorOnly(true),
 	)

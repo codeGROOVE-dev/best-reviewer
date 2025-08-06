@@ -27,12 +27,15 @@ const (
 	prCacheTTL        = 20 * 24 * time.Hour // Cache PRs for 20 days (use updated_at to invalidate)
 	searchCacheTTL    = 15 * time.Minute    // Cache search results for 15 minutes
 
-	// Specific cache TTLs for different data types
+	// Specific cache TTLs for different data types.
 	userTypeCacheTTL         = 30 * 24 * time.Hour // User type never changes
 	repoContributorsCacheTTL = 4 * time.Hour       // 4 hours - catch people returning from vacation
 	directoryOwnersCacheTTL  = 3 * 24 * time.Hour  // Directory ownership changes slowly
 	recentPRsCacheTTL        = 1 * time.Hour       // Recent PRs for active repos
 	fileHistoryCacheTTL      = 3 * 24 * time.Hour  // File history changes slowly
+	prCountCacheTTL          = 6 * time.Hour       // PR count for workload balancing (default).
+	prCountFailureCacheTTL   = 10 * time.Minute    // Cache failures to avoid repeated API calls.
+	prStaleDaysThreshold     = 90                  // PRs older than this are considered stale.
 
 	// API and pagination limits.
 	perPageLimit = 100 // GitHub API per_page limit
@@ -56,17 +59,20 @@ const (
 	topCandidatesToLog = 5   // Number of top candidates to log
 	maxContextScore    = 100 // Maximum context score for candidates
 
-	// Scoring weights (must sum to 100)
+	// Scoring weights (must sum to 100).
 	fileOverlapWeight = 40.0 // Weight for file overlap score
 	recencyWeight     = 35.0 // Weight for recency score
 	expertiseWeight   = 25.0 // Weight for domain expertise score
 
-	// File significance multipliers
+	// File significance multipliers.
 	prodCodeMultiplier     = 1.5 // Production code vs test code
 	criticalFileMultiplier = 1.3 // Main.go, handlers, etc.
 	refactoringMultiplier  = 1.2 // More deletions than additions
 
-	// Retry parameters handled by external library
+	// Retry parameters handled by external library.
+	maxRetryAttempts  = 25               // Maximum retry attempts for API calls.
+	initialRetryDelay = 5 * time.Second  // Initial delay for retry attempts.
+	maxRetryDelay     = 20 * time.Minute // Maximum delay for retry attempts.
 
 	// PR URL parsing.
 	minURLParts = 4 // Minimum parts in PR URL

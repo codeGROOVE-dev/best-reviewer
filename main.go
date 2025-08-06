@@ -19,10 +19,12 @@ var (
 	org     = flag.String("org", "", "GitHub organization to monitor")
 
 	// Behavior flags.
-	poll        = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
-	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual approvals)")
-	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
-	maxOpenTime = flag.Duration("max-age", 180*24*time.Hour, "Maximum time since last activity for PR assignment")
+	poll         = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
+	dryRun       = flag.Bool("dry-run", false, "Run in dry-run mode (no actual approvals)")
+	minOpenTime  = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
+	maxOpenTime  = flag.Duration("max-age", 180*24*time.Hour, "Maximum time since last activity for PR assignment")
+	maxPRs       = flag.Int("max-prs", 9, "Maximum number of non-stale open PRs a candidate can have before being filtered out")
+	prCountCache = flag.Duration("pr-count-cache", prCountCacheTTL, "Cache duration for PR count queries (e.g., 6h, 12h)")
 )
 
 func main() {
@@ -40,11 +42,13 @@ func main() {
 	}
 
 	finder := &ReviewerFinder{
-		client:      client,
-		dryRun:      *dryRun,
-		minOpenTime: *minOpenTime,
-		maxOpenTime: *maxOpenTime,
-		output:      &outputFormatter{verbose: true},
+		client:       client,
+		dryRun:       *dryRun,
+		minOpenTime:  *minOpenTime,
+		maxOpenTime:  *maxOpenTime,
+		maxPRs:       *maxPRs,
+		prCountCache: *prCountCache,
+		output:       &outputFormatter{verbose: true},
 	}
 
 	if *poll > 0 {

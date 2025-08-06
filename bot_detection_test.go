@@ -89,6 +89,7 @@ func TestIsValidReviewer(t *testing.T) {
 	// Create a mock GitHub client that returns specific user types
 	mockClient := &GitHubClient{
 		httpClient: &http.Client{},
+		cache:      &cache{entries: make(map[string]cacheEntry)},
 		userCache:  &userCache{users: make(map[string]*userInfo)},
 		token:      "test-token",
 	}
@@ -101,10 +102,18 @@ func TestIsValidReviewer(t *testing.T) {
 	mockClient.userCache.users["deploy-service"] = &userInfo{login: "deploy-service", userType: userTypeBot}
 	mockClient.userCache.users["johndoe"] = &userInfo{login: "johndoe", userType: userTypeUser}
 	mockClient.userCache.users["sergiodj"] = &userInfo{login: "sergiodj", userType: userTypeUser}
+	mockClient.userCache.users["busyuser"] = &userInfo{login: "busyuser", userType: userTypeUser}
 
 	rf := &ReviewerFinder{
-		client: mockClient,
+		client:       mockClient,
+		maxPRs:       9,
+		prCountCache: prCountCacheTTL,
 	}
+
+	// Mock the PR count in cache to avoid API calls
+	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "johndoe"), 5, prCountCacheTTL)
+	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "sergiodj"), 3, prCountCacheTTL)
+	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "busyuser"), 10, prCountCacheTTL) // Over limit
 
 	ctx := context.Background()
 	pr := &PullRequest{Owner: "test", Repository: "repo"}
@@ -120,6 +129,7 @@ func TestIsValidReviewer(t *testing.T) {
 		{"Bot with API confirmation", "dependabot[bot]", false},
 		{"Pattern-based bot", "github-actions", false},
 		{"Service account", "deploy-service", false},
+		{"User with too many PRs", "busyuser", false},
 
 		// Should be valid
 		{"Regular user", "johndoe", true},

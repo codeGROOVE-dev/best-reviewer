@@ -13,11 +13,13 @@ import (
 
 // ReviewerFinder finds and assigns reviewers to pull requests.
 type ReviewerFinder struct {
-	client      *GitHubClient
-	output      *outputFormatter
-	minOpenTime time.Duration
-	maxOpenTime time.Duration
-	dryRun      bool
+	client       *GitHubClient
+	output       *outputFormatter
+	minOpenTime  time.Duration
+	maxOpenTime  time.Duration
+	maxPRs       int
+	prCountCache time.Duration
+	dryRun       bool
 }
 
 // findAndAssignReviewers is the main entry point for finding and assigning reviewers.
@@ -323,8 +325,21 @@ func (rf *ReviewerFinder) isValidReviewer(ctx context.Context, pr *PullRequest, 
 	hasAccess := rf.hasWriteAccess(ctx, pr.Owner, pr.Repository, username)
 	if !hasAccess {
 		log.Printf("    Filtered (no write access): %s", username)
+		return false
 	}
-	return hasAccess
+
+	// Check PR count for workload balancing across the organization
+	// This is a best-effort check - if it fails, we continue with the candidate
+	prCount, err := rf.client.openPRCount(ctx, pr.Owner, username, rf.prCountCache)
+	if err != nil {
+		log.Printf("    ⚠️  Warning: could not check PR count for %s in org %s: %v (continuing without PR count filter)", username, pr.Owner, err)
+		// Continue without filtering - better to have a reviewer than none at all
+	} else if prCount > rf.maxPRs {
+		log.Printf("    Filtered (too many open PRs %d > %d in org %s): %s", prCount, rf.maxPRs, pr.Owner, username)
+		return false
+	}
+
+	return true
 }
 
 // findExpertReviewer finds the most active reviewer for the changes.
