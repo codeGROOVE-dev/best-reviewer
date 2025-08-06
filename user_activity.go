@@ -172,92 +172,172 @@ func (rf *ReviewerFinder) parseUserActivity(result map[string]any, activities ma
 }
 
 // parsePRNode parses a single PR node for user activity.
+// parsePRNode parses a single PR node for user activity.
 func (rf *ReviewerFinder) parsePRNode(node any, activities map[string]UserActivity) {
 	pr, ok := node.(map[string]any)
 	if !ok {
 		return
 	}
 
-	// Get PR dates
-	var prDate time.Time
+	prDate := rf.extractPRDate(pr)
+
+	rf.trackPRAuthor(pr, activities, prDate)
+	rf.trackPRReviewers(pr, activities)
+	rf.trackPRParticipants(pr, activities, prDate)
+}
+
+// extractPRDate extracts the relevant date from a PR.
+func (*ReviewerFinder) extractPRDate(pr map[string]any) time.Time {
+	// Try merged date first
 	if mergedAtStr, ok := pr["mergedAt"].(string); ok && mergedAtStr != "" {
 		if t, err := time.Parse(time.RFC3339, mergedAtStr); err == nil {
-			prDate = t
+			return t
 		}
-	} else if updatedAtStr, ok := pr["updatedAt"].(string); ok {
+	}
+
+	// Fall back to updated date
+	if updatedAtStr, ok := pr["updatedAt"].(string); ok {
 		if t, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
-			prDate = t
+			return t
 		}
 	}
 
-	// Track PR author
-	if author, ok := pr["author"].(map[string]any); ok {
-		if login, ok := author["login"].(string); ok && login != "" {
-			// Cache the user type
-			if typeName, ok := author["__typename"].(string); ok {
-				rf.client.cacheUserTypeFromGraphQL(login, typeName)
-				if typeName == "Bot" {
-					return // Skip bots
-				}
-			}
-			// Also check username patterns for bots that show as "User"
-			if isLikelyBot(login) {
-				rf.client.cacheUserTypeFromGraphQL(login, "Bot") // Cache as bot
-				return                                           // Skip likely bots
-			}
-			rf.updateUserActivity(activities, login, prDate, "pr_author")
+	return time.Time{}
+}
+
+// trackPRAuthor tracks the PR author's activity.
+func (rf *ReviewerFinder) trackPRAuthor(pr map[string]any, activities map[string]UserActivity, prDate time.Time) {
+	author, ok := pr["author"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	login, ok := author["login"].(string)
+	if !ok || login == "" {
+		return
+	}
+
+	// Check and cache user type
+	if typeName, ok := author["__typename"].(string); ok {
+		rf.client.cacheUserTypeFromGraphQL(login, typeName)
+		if typeName == "Bot" {
+			return
 		}
 	}
 
-	// Track reviewers
-	if reviews, ok := pr["reviews"].(map[string]any); ok {
-		if reviewNodes, ok := reviews["nodes"].([]any); ok {
-			for _, reviewNode := range reviewNodes {
-				if review, ok := reviewNode.(map[string]any); ok {
-					if author, ok := review["author"].(map[string]any); ok {
-						if login, ok := author["login"].(string); ok && login != "" {
-							// Check if it's a bot
-							if typeName, ok := author["__typename"].(string); ok && typeName == "Bot" {
-								continue // Skip bots
-							}
-							// Also check username patterns
-							if isLikelyBot(login) {
-								continue // Skip likely bots
-							}
-							var reviewDate time.Time
-							if submittedAtStr, ok := review["submittedAt"].(string); ok {
-								if t, err := time.Parse(time.RFC3339, submittedAtStr); err == nil {
-									reviewDate = t
-								}
-							}
-							rf.updateUserActivity(activities, login, reviewDate, "pr_reviewer")
-						}
-					}
-				}
-			}
-		}
+	// Check username patterns for bots
+	if isLikelyBot(login) {
+		rf.client.cacheUserTypeFromGraphQL(login, "Bot")
+		return
 	}
 
-	// Track participants
-	if participants, ok := pr["participants"].(map[string]any); ok {
-		if participantNodes, ok := participants["nodes"].([]any); ok {
-			for _, participantNode := range participantNodes {
-				if participant, ok := participantNode.(map[string]any); ok {
-					if login, ok := participant["login"].(string); ok && login != "" {
-						// Check if it's a bot
-						if typeName, ok := participant["__typename"].(string); ok && typeName == "Bot" {
-							continue // Skip bots
-						}
-						// Also check username patterns
-						if isLikelyBot(login) {
-							continue // Skip likely bots
-						}
-						rf.updateUserActivity(activities, login, prDate, "participant")
-					}
-				}
-			}
-		}
+	rf.updateUserActivity(activities, login, prDate, "pr_author")
+}
+
+// trackPRReviewers tracks all reviewers' activity from a PR.
+func (rf *ReviewerFinder) trackPRReviewers(pr map[string]any, activities map[string]UserActivity) {
+	reviews, ok := pr["reviews"].(map[string]any)
+	if !ok {
+		return
 	}
+
+	reviewNodes, ok := reviews["nodes"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, reviewNode := range reviewNodes {
+		rf.trackSingleReviewer(reviewNode, activities)
+	}
+}
+
+// trackSingleReviewer tracks a single reviewer's activity.
+func (rf *ReviewerFinder) trackSingleReviewer(reviewNode any, activities map[string]UserActivity) {
+	review, ok := reviewNode.(map[string]any)
+	if !ok {
+		return
+	}
+
+	author, ok := review["author"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	login, ok := author["login"].(string)
+	if !ok || login == "" {
+		return
+	}
+
+	// Skip bots
+	if rf.isBot(author, login) {
+		return
+	}
+
+	reviewDate := rf.extractReviewDate(review)
+	rf.updateUserActivity(activities, login, reviewDate, "pr_reviewer")
+}
+
+// extractReviewDate extracts the date from a review.
+func (*ReviewerFinder) extractReviewDate(review map[string]any) time.Time {
+	submittedAtStr, ok := review["submittedAt"].(string)
+	if !ok {
+		return time.Time{}
+	}
+
+	t, err := time.Parse(time.RFC3339, submittedAtStr)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return t
+}
+
+// trackPRParticipants tracks all participants' activity from a PR.
+func (rf *ReviewerFinder) trackPRParticipants(pr map[string]any, activities map[string]UserActivity, prDate time.Time) {
+	participants, ok := pr["participants"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	participantNodes, ok := participants["nodes"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, participantNode := range participantNodes {
+		rf.trackSingleParticipant(participantNode, activities, prDate)
+	}
+}
+
+// trackSingleParticipant tracks a single participant's activity.
+func (rf *ReviewerFinder) trackSingleParticipant(participantNode any, activities map[string]UserActivity, prDate time.Time) {
+	participant, ok := participantNode.(map[string]any)
+	if !ok {
+		return
+	}
+
+	login, ok := participant["login"].(string)
+	if !ok || login == "" {
+		return
+	}
+
+	// Skip bots
+	if rf.isBot(participant, login) {
+		return
+	}
+
+	rf.updateUserActivity(activities, login, prDate, "participant")
+}
+
+// isBot checks if a user is a bot based on type and username patterns.
+func (*ReviewerFinder) isBot(userNode map[string]any, login string) bool {
+	// Check __typename field
+	if typeName, ok := userNode["__typename"].(string); ok && typeName == "Bot" {
+		return true
+	}
+
+	// Check username patterns
+	return isLikelyBot(login)
 }
 
 // parseIssueNode parses a single issue node for user activity.

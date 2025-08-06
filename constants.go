@@ -36,6 +36,10 @@ const (
 	prCountCacheTTL          = 6 * time.Hour       // PR count for workload balancing (default).
 	prCountFailureCacheTTL   = 10 * time.Minute    // Cache failures to avoid repeated API calls.
 	prStaleDaysThreshold     = 90                  // PRs older than this are considered stale.
+	maxTokenLength           = 100                 // Maximum expected length for GitHub tokens.
+	maxURLLength             = 500                 // Maximum URL length to validate.
+	maxPRNumber              = 999999              // Maximum PR number to validate.
+	maxGitHubNameLength      = 100                 // Maximum length for GitHub owner/repo names.
 
 	// API and pagination limits.
 	perPageLimit = 100 // GitHub API per_page limit
@@ -94,12 +98,12 @@ const (
 	reviewerWeightMultiplier = 0.5  // Weight multiplier for reviewers vs authors
 
 	// Overlap scoring constants.
-	contextMatchWeight = 0.7 // Weight for context matches in overlap scoring
+	contextMatchWeight  = 0.7 // Weight for context matches in overlap scoring
 	minOverlapThreshold = 5.0 // Minimum overlap score threshold
 
 	// Analysis limits.
-	maxRecentCommits       = 10 // Maximum recent commits to analyze
-	maxDirectoryReviewers  = 5  // Maximum directory reviewers to return
+	maxRecentCommits      = 10 // Maximum recent commits to analyze
+	maxDirectoryReviewers = 5  // Maximum directory reviewers to return
 
 	// Batch processing sizes.
 	defaultBatchSize = 20 // Default batch size for processing

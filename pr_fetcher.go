@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -49,7 +51,7 @@ func (rf *ReviewerFinder) prsForOrg(ctx context.Context, org string) ([]*PullReq
 	for {
 		// Use GitHub search API to get all open PRs for the org in one query
 		log.Printf("[API] Searching for open PRs across entire organization %s (page %d) to find all PRs needing reviewer assignment", org, page)
-		url := fmt.Sprintf("https://api.github.com/search/issues?q=org:%s+type:pr+state:open&per_page=100&page=%d", org, page)
+		searchURL := fmt.Sprintf("https://api.github.com/search/issues?q=org:%s+type:pr+state:open&per_page=100&page=%d", org, page)
 
 		// Extract API call to avoid defer in loop
 		searchResults, shouldBreak, err := func() ([]struct {
@@ -60,7 +62,7 @@ func (rf *ReviewerFinder) prsForOrg(ctx context.Context, org string) ([]*PullReq
 			Number        int    `json:"number"`
 		}, bool, error,
 		) {
-			resp, err := rf.client.makeRequest(ctx, httpMethodGet, url, nil)
+			resp, err := rf.client.makeRequest(ctx, httpMethodGet, searchURL, nil)
 			if err != nil {
 				return nil, false, fmt.Errorf("failed to search org PRs: %w", err)
 			}
@@ -134,12 +136,32 @@ type prURLParts struct {
 
 // parsePRURL parses a PR URL in various formats.
 func parsePRURL(prURL string) (prURLParts, error) {
+	// Validate input length
+	if len(prURL) > maxURLLength {
+		return prURLParts{}, errors.New("URL too long")
+	}
 	// Handle GitHub URL format: https://github.com/owner/repo/pull/123
 	if strings.HasPrefix(prURL, "https://github.com/") {
-		parts := strings.Split(strings.TrimPrefix(prURL, "https://github.com/"), "/")
+		// Parse and validate URL
+		parsedURL, err := url.Parse(prURL)
+		if err != nil {
+			return prURLParts{}, fmt.Errorf("invalid URL format: %w", err)
+		}
+
+		// Ensure it's actually github.com
+		if parsedURL.Host != "github.com" {
+			return prURLParts{}, errors.New("invalid GitHub URL host")
+		}
+
+		parts := strings.Split(strings.TrimPrefix(parsedURL.Path, "/"), "/")
 		if len(parts) >= minURLParts && parts[2] == "pull" {
+			// Validate owner and repo names
+			if !isValidGitHubName(parts[0]) || !isValidGitHubName(parts[1]) {
+				return prURLParts{}, errors.New("invalid owner or repo name")
+			}
+
 			number, err := strconv.Atoi(parts[3])
-			if err != nil {
+			if err != nil || number <= 0 || number > maxPRNumber {
 				return prURLParts{}, fmt.Errorf("invalid PR number: %s", parts[3])
 			}
 			return prURLParts{
@@ -169,5 +191,15 @@ func parsePRURL(prURL string) (prURLParts, error) {
 		}
 	}
 
-	return prURLParts{}, fmt.Errorf("invalid PR URL format: %s", prURL)
+	return prURLParts{}, errors.New("invalid PR URL format")
+}
+
+// isValidGitHubName validates GitHub owner/repo names.
+func isValidGitHubName(name string) bool {
+	if name == "" || len(name) > maxGitHubNameLength {
+		return false
+	}
+	// GitHub names can contain alphanumeric characters, hyphens, underscores, and dots
+	validName := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-_.]*$`)
+	return validName.MatchString(name)
 }

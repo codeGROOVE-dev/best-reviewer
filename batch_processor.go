@@ -255,34 +255,73 @@ func (rf *ReviewerFinder) prsForOrgWithBatchSize(ctx context.Context, org string
 
 // parseOrgPRsFromGraphQL parses PRs from GraphQL response.
 func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) (prs []*PullRequest, hasNextPage bool, cursor string) {
-
-	// Navigate through the GraphQL response structure
-	if data, ok := result["data"].(map[string]any); ok {
-		if org, ok := data["organization"].(map[string]any); ok {
-			if repos, ok := org["repositories"].(map[string]any); ok {
-				// Get pagination info
-				if pageInfo, ok := repos["pageInfo"].(map[string]any); ok {
-					if next, ok := pageInfo["hasNextPage"].(bool); ok {
-						hasNextPage = next
-					}
-					if endCursor, ok := pageInfo["endCursor"].(string); ok {
-						cursor = endCursor
-					}
-				}
-
-				// Process repositories
-				if nodes, ok := repos["nodes"].([]any); ok {
-					for _, node := range nodes {
-						if repo, ok := node.(map[string]any); ok {
-							prs = append(prs, rf.parsePRsFromRepo(repo)...)
-						}
-					}
-				}
-			}
-		}
+	repos := rf.extractOrgRepositories(result)
+	if repos == nil {
+		return prs, false, ""
 	}
 
+	hasNextPage, cursor = rf.extractPaginationInfo(repos)
+	prs = rf.extractPRsFromRepos(repos)
+
 	return prs, hasNextPage, cursor
+}
+
+// extractOrgRepositories extracts the repositories object from org GraphQL response.
+func (*ReviewerFinder) extractOrgRepositories(result map[string]any) map[string]any {
+	data, ok := result["data"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	org, ok := data["organization"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	repos, ok := org["repositories"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	return repos
+}
+
+// extractPaginationInfo extracts pagination info from repositories response.
+func (*ReviewerFinder) extractPaginationInfo(repos map[string]any) (hasNextPage bool, cursor string) {
+	pageInfo, ok := repos["pageInfo"].(map[string]any)
+	if !ok {
+		return false, ""
+	}
+
+	if next, ok := pageInfo["hasNextPage"].(bool); ok {
+		hasNextPage = next
+	}
+
+	if endCursor, ok := pageInfo["endCursor"].(string); ok {
+		cursor = endCursor
+	}
+
+	return hasNextPage, cursor
+}
+
+// extractPRsFromRepos extracts PRs from repository nodes.
+func (rf *ReviewerFinder) extractPRsFromRepos(repos map[string]any) []*PullRequest {
+	var prs []*PullRequest
+
+	nodes, ok := repos["nodes"].([]any)
+	if !ok {
+		return prs
+	}
+
+	for _, node := range nodes {
+		repo, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+		prs = append(prs, rf.parsePRsFromRepo(repo)...)
+	}
+
+	return prs
 }
 
 // parsePRsFromRepo parses PRs from a repository node.
@@ -323,26 +362,43 @@ func (rf *ReviewerFinder) parsePRFromGraphQL(prData map[string]any, owner, repo 
 		Repository: repo,
 	}
 
-	// Parse basic fields
+	rf.parseBasicPRFields(prData, pr)
+	rf.parsePRAuthor(prData, pr)
+	rf.parsePRDates(prData, pr)
+	rf.parsePRAssignees(prData, pr)
+	rf.parsePRReviewers(prData, pr)
+	rf.parsePRLastCommit(prData, pr)
+
+	return pr
+}
+
+// parseBasicPRFields parses basic PR fields like number, title, and draft status.
+func (*ReviewerFinder) parseBasicPRFields(prData map[string]any, pr *PullRequest) {
 	if number, ok := prData["number"].(float64); ok {
 		pr.Number = int(number)
 	}
 	if title, ok := prData["title"].(string); ok {
 		pr.Title = title
 	}
-	// URL field doesn't exist in PullRequest struct, skip it
 	if isDraft, ok := prData["isDraft"].(bool); ok {
 		pr.Draft = isDraft
 	}
+}
 
-	// Parse author
-	if author, ok := prData["author"].(map[string]any); ok {
-		if login, ok := author["login"].(string); ok {
-			pr.Author = login
-		}
+// parsePRAuthor parses the PR author information.
+func (*ReviewerFinder) parsePRAuthor(prData map[string]any, pr *PullRequest) {
+	author, ok := prData["author"].(map[string]any)
+	if !ok {
+		return
 	}
 
-	// Parse dates
+	if login, ok := author["login"].(string); ok {
+		pr.Author = login
+	}
+}
+
+// parsePRDates parses PR creation and update dates.
+func (*ReviewerFinder) parsePRDates(prData map[string]any, pr *PullRequest) {
 	if createdAt, ok := prData["createdAt"].(string); ok {
 		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 			pr.CreatedAt = t
@@ -353,60 +409,86 @@ func (rf *ReviewerFinder) parsePRFromGraphQL(prData map[string]any, owner, repo 
 			pr.UpdatedAt = t
 		}
 	}
+}
 
-	// Parse assignees
-	if assignees, ok := prData["assignees"].(map[string]any); ok {
-		if nodes, ok := assignees["nodes"].([]any); ok {
-			for _, node := range nodes {
-				if assignee, ok := node.(map[string]any); ok {
-					if login, ok := assignee["login"].(string); ok {
-						pr.Assignees = append(pr.Assignees, login)
-					}
-				}
-			}
-		}
+// parsePRAssignees parses the list of PR assignees.
+func (*ReviewerFinder) parsePRAssignees(prData map[string]any, pr *PullRequest) {
+	assignees, ok := prData["assignees"].(map[string]any)
+	if !ok {
+		return
 	}
 
-	// Parse existing reviewers
-	if reviewRequests, ok := prData["reviewRequests"].(map[string]any); ok {
-		if nodes, ok := reviewRequests["nodes"].([]any); ok {
-			for _, node := range nodes {
-				if request, ok := node.(map[string]any); ok {
-					if reviewer, ok := request["requestedReviewer"].(map[string]any); ok {
-						if login, ok := reviewer["login"].(string); ok {
-							pr.Reviewers = append(pr.Reviewers, login)
-						}
-					}
-				}
-			}
-		}
+	nodes, ok := assignees["nodes"].([]any)
+	if !ok {
+		return
 	}
 
-	// Parse last commit date
-	if commits, ok := prData["commits"].(map[string]any); ok {
-		if nodes, ok := commits["nodes"].([]any); ok && len(nodes) > 0 {
-			if commit, ok := nodes[0].(map[string]any); ok {
-				if commitData, ok := commit["commit"].(map[string]any); ok {
-					if committedDate, ok := commitData["committedDate"].(string); ok {
-						if t, err := time.Parse(time.RFC3339, committedDate); err == nil {
-							pr.LastCommit = t
-						}
-					}
-				}
-			}
+	for _, node := range nodes {
+		assignee, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if login, ok := assignee["login"].(string); ok {
+			pr.Assignees = append(pr.Assignees, login)
 		}
 	}
+}
 
-	// LastReview will be fetched on-demand when needed for detailed analysis
-	// Removed from initial query to reduce GraphQL payload size
+// parsePRReviewers parses the list of requested reviewers.
+func (*ReviewerFinder) parsePRReviewers(prData map[string]any, pr *PullRequest) {
+	reviewRequests, ok := prData["reviewRequests"].(map[string]any)
+	if !ok {
+		return
+	}
 
-	// Parse file statistics - these fields don't exist in our PullRequest struct
-	// We would need to fetch file details separately if needed
-	// additions, deletions, and changedFiles are available in the GraphQL response
-	// but our PullRequest struct doesn't have these fields directly
+	nodes, ok := reviewRequests["nodes"].([]any)
+	if !ok {
+		return
+	}
 
-	// Note: ChangedFiles array would need a separate query for file details
-	// For now, we'll fetch those on-demand when needed
+	for _, node := range nodes {
+		request, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
 
-	return pr
+		reviewer, ok := request["requestedReviewer"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if login, ok := reviewer["login"].(string); ok {
+			pr.Reviewers = append(pr.Reviewers, login)
+		}
+	}
+}
+
+// parsePRLastCommit parses the last commit date from the PR.
+func (*ReviewerFinder) parsePRLastCommit(prData map[string]any, pr *PullRequest) {
+	commits, ok := prData["commits"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	nodes, ok := commits["nodes"].([]any)
+	if !ok || len(nodes) == 0 {
+		return
+	}
+
+	commit, ok := nodes[0].(map[string]any)
+	if !ok {
+		return
+	}
+
+	commitData, ok := commit["commit"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	if committedDate, ok := commitData["committedDate"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, committedDate); err == nil {
+			pr.LastCommit = t
+		}
+	}
 }

@@ -241,29 +241,37 @@ func (*ReviewerFinder) parsePatchForChangedLines(patch string) map[int]bool {
 	contextLines := 2 // Include 2 lines before and after
 
 	for _, line := range strings.Split(patch, "\n") {
-		if strings.HasPrefix(line, "@@") {
-			// Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-			var newStart, newCount int
-			parts := strings.Split(line, " ")
-			if len(parts) >= 3 {
-				newPart := strings.TrimPrefix(parts[2], "+")
-				if _, err := fmt.Sscanf(newPart, "%d,%d", &newStart, &newCount); err == nil {
-					// Mark all lines in this hunk as changed, plus context
-					for i := -contextLines; i < newCount+contextLines; i++ {
-						lineNum := newStart + i
-						if lineNum > 0 { // Ensure valid line numbers
-							lines[lineNum] = true
-						}
-					}
-				} else if _, err := fmt.Sscanf(newPart, "%d", &newStart); err == nil {
-					// Single line change, include context
-					for i := -contextLines; i <= contextLines; i++ {
-						lineNum := newStart + i
-						if lineNum > 0 {
-							lines[lineNum] = true
-						}
-					}
-				}
+		if !strings.HasPrefix(line, "@@") {
+			continue
+		}
+
+		// Process hunk header line
+		parts := strings.Split(line, " ")
+		if len(parts) < 3 {
+			continue
+		}
+
+		newPart := strings.TrimPrefix(parts[2], "+")
+
+		// Parse range from hunk header
+		var newStart, newCount int
+		if _, err := fmt.Sscanf(newPart, "%d,%d", &newStart, &newCount); err != nil {
+			// Try to parse as single line "start"
+			if _, err := fmt.Sscanf(newPart, "%d", &newStart); err != nil {
+				continue
+			}
+			newCount = 1
+		}
+
+		if newStart == 0 {
+			continue
+		}
+
+		// Mark changed lines in the map
+		for i := -contextLines; i < newCount+contextLines; i++ {
+			lineNum := newStart + i
+			if lineNum > 0 {
+				lines[lineNum] = true
 			}
 		}
 	}

@@ -84,7 +84,7 @@ func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error
 		isAppAuth = true
 		log.Print("[AUTH] Using GitHub App authentication")
 	} else {
-		// Use gh CLI authentication
+		// Use gh CLI authentication with validation
 		cmd := exec.CommandContext(ctx, "gh", "auth", "token")
 		output, err := cmd.Output()
 		if err != nil {
@@ -92,6 +92,15 @@ func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error
 		}
 
 		token = strings.TrimSpace(string(output))
+		// Validate token format (should be alphanumeric with underscores)
+		if token == "" || len(token) > maxTokenLength {
+			return nil, errors.New("invalid token length from gh command")
+		}
+		for _, r := range token {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' {
+				return nil, errors.New("invalid token format from gh command")
+			}
+		}
 		if token == "" {
 			return nil, errors.New("no GitHub token found")
 		}
@@ -116,7 +125,12 @@ func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error
 
 // makeRequest makes an HTTP request to the GitHub API with retry logic.
 func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
-	log.Printf("[HTTP] %s %s", method, apiURL)
+	// Sanitize URL for logging - remove potential sensitive query parameters
+	sanitizedURL := apiURL
+	if idx := strings.Index(apiURL, "?"); idx != -1 {
+		sanitizedURL = apiURL[:idx] + "?[REDACTED]"
+	}
+	log.Printf("[HTTP] %s %s", method, sanitizedURL)
 
 	var resp *http.Response
 	err := retryWithBackoff(ctx, fmt.Sprintf("%s %s", method, apiURL), func() error {
@@ -175,7 +189,13 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 		return nil, err
 	}
 
-	log.Printf("[HTTP] %s %s - Status: %d", method, apiURL, resp.StatusCode)
+	// Sanitize URL for logging (reuse variable)
+	if idx := strings.Index(apiURL, "?"); idx != -1 {
+		sanitizedURL = apiURL[:idx] + "?[REDACTED]"
+	} else {
+		sanitizedURL = apiURL
+	}
+	log.Printf("[HTTP] %s %s - Status: %d", method, sanitizedURL, resp.StatusCode)
 	return resp, nil
 }
 

@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -233,33 +233,108 @@ func (pl *ProgressiveLoader) fetchCodeOwners(ctx context.Context, owner, repo st
 	locations := []string{".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"}
 
 	for _, loc := range locations {
-		func() {
-			url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, loc)
-			resp, err := pl.client.makeRequest(ctx, httpMethodGet, url, nil)
-			if err != nil {
-				return
-			}
-			defer func() {
-				if err := resp.Body.Close(); err != nil {
-					log.Printf("[WARN] Failed to close response body: %v", err)
-				}
-			}()
+		owners := pl.tryFetchCodeOwnersFile(ctx, owner, repo, loc)
+		if owners != nil {
+			return owners
+		}
+	}
+	return nil
+}
 
-			if resp.StatusCode == http.StatusOK {
-				// Parse CODEOWNERS file
-				// This is simplified - real implementation would decode base64 content
-				return
-			}
-		}()
+// tryFetchCodeOwnersFile attempts to fetch and parse a CODEOWNERS file from a specific location.
+func (pl *ProgressiveLoader) tryFetchCodeOwnersFile(ctx context.Context, owner, repo, location string) map[string][]string {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, location)
+	resp, err := pl.client.makeRequest(ctx, httpMethodGet, url, nil)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
 	}
 
-	return nil
+	var content struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&content); err != nil {
+		log.Printf("[WARN] Failed to decode CODEOWNERS content: %v", err)
+		return nil
+	}
+
+	// Decode base64 content
+	decodedContent, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", ""))
+	if err != nil {
+		log.Printf("[WARN] Failed to decode base64 content: %v", err)
+		return nil
+	}
+
+	return parseCodeOwnersContent(string(decodedContent))
+}
+
+// parseCodeOwnersContent parses the CODEOWNERS file content.
+func parseCodeOwnersContent(content string) map[string][]string {
+	owners := make(map[string][]string)
+	lines := strings.Split(content, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		pattern := parts[0]
+		var reviewers []string
+		for _, reviewer := range parts[1:] {
+			// Remove @ prefix if present
+			reviewer = strings.TrimPrefix(reviewer, "@")
+			if reviewer != "" {
+				reviewers = append(reviewers, reviewer)
+			}
+		}
+
+		if len(reviewers) > 0 {
+			owners[pattern] = reviewers
+		}
+	}
+
+	return owners
 }
 
 // fetchDirectoryReviewers fetches recent reviewers for a specific directory.
 func (pl *ProgressiveLoader) fetchDirectoryReviewers(ctx context.Context, owner, repo, dir string) []string {
-	// Use GraphQL to get recent PRs that touched this directory
-	query := `
+	query := pl.buildDirectoryReviewersQuery()
+	variables := map[string]any{
+		"owner": owner,
+		"repo":  repo,
+	}
+
+	result, err := pl.client.makeGraphQLRequest(ctx, query, variables)
+	if err != nil {
+		return nil
+	}
+
+	prs := pl.extractPullRequests(result)
+	if prs == nil {
+		return nil
+	}
+
+	reviewerCount := pl.countDirectoryReviewers(prs, dir)
+	return topNByCount(reviewerCount, maxDirectoryReviewers)
+}
+
+// buildDirectoryReviewersQuery builds the GraphQL query for directory reviewers.
+func (*ProgressiveLoader) buildDirectoryReviewersQuery() string {
+	return `
 	query($owner: String!, $repo: String!) {
 		repository(owner: $owner, name: $repo) {
 			pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
@@ -276,67 +351,114 @@ func (pl *ProgressiveLoader) fetchDirectoryReviewers(ctx context.Context, owner,
 			}
 		}
 	}`
+}
 
-	variables := map[string]any{
-		"owner": owner,
-		"repo":  repo,
-	}
-
-	result, err := pl.client.makeGraphQLRequest(ctx, query, variables)
-	if err != nil {
+// extractPullRequests extracts PR nodes from GraphQL response.
+func (*ProgressiveLoader) extractPullRequests(result map[string]any) []any {
+	data, ok := result["data"].(map[string]any)
+	if !ok {
 		return nil
 	}
 
-	// Parse and count reviewers (simplified)
-	reviewerCount := make(map[string]int)
-	if data, ok := result["data"].(map[string]any); ok {
-		if repository, ok := data["repository"].(map[string]any); ok {
-			if prs, ok := repository["pullRequests"].(map[string]any); ok {
-				if nodes, ok := prs["nodes"].([]any); ok {
-					for _, node := range nodes {
-						if pr, ok := node.(map[string]any); ok {
-							// Check if PR touched the directory
-							if files, ok := pr["files"].(map[string]any); ok {
-								if fileNodes, ok := files["nodes"].([]any); ok {
-									touchesDir := false
-									for _, fileNode := range fileNodes {
-										if file, ok := fileNode.(map[string]any); ok {
-											if path, ok := file["path"].(string); ok {
-												if strings.HasPrefix(path, dir+"/") {
-													touchesDir = true
-													break
-												}
-											}
-										}
-									}
+	repository, ok := data["repository"].(map[string]any)
+	if !ok {
+		return nil
+	}
 
-									if touchesDir {
-										// Count reviewers
-										if reviews, ok := pr["reviews"].(map[string]any); ok {
-											if reviewNodes, ok := reviews["nodes"].([]any); ok {
-												for _, reviewNode := range reviewNodes {
-													if review, ok := reviewNode.(map[string]any); ok {
-														if author, ok := review["author"].(map[string]any); ok {
-															if login, ok := author["login"].(string); ok {
-																reviewerCount[login]++
-															}
-														}
-													}
-												}
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
+	prs, ok := repository["pullRequests"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	nodes, ok := prs["nodes"].([]any)
+	if !ok {
+		return nil
+	}
+
+	return nodes
+}
+
+// countDirectoryReviewers counts reviewers for PRs that touched a specific directory.
+func (pl *ProgressiveLoader) countDirectoryReviewers(prs []any, dir string) map[string]int {
+	reviewerCount := make(map[string]int)
+
+	for _, node := range prs {
+		pr, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if !pl.prTouchesDirectory(pr, dir) {
+			continue
+		}
+
+		pl.countPRReviewers(pr, reviewerCount)
+	}
+
+	return reviewerCount
+}
+
+// prTouchesDirectory checks if a PR touched a specific directory.
+func (*ProgressiveLoader) prTouchesDirectory(pr map[string]any, dir string) bool {
+	files, ok := pr["files"].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	fileNodes, ok := files["nodes"].([]any)
+	if !ok {
+		return false
+	}
+
+	for _, fileNode := range fileNodes {
+		file, ok := fileNode.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		path, ok := file["path"].(string)
+		if !ok {
+			continue
+		}
+
+		if strings.HasPrefix(path, dir+"/") {
+			return true
 		}
 	}
 
-	// Sort by count and return top reviewers
-	return topNByCount(reviewerCount, maxDirectoryReviewers)
+	return false
+}
+
+// countPRReviewers counts reviewers from a single PR.
+func (*ProgressiveLoader) countPRReviewers(pr map[string]any, reviewerCount map[string]int) {
+	reviews, ok := pr["reviews"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	reviewNodes, ok := reviews["nodes"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, reviewNode := range reviewNodes {
+		review, ok := reviewNode.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		login, ok := author["login"].(string)
+		if !ok {
+			continue
+		}
+
+		reviewerCount[login]++
+	}
 }
 
 // uniqueDirectories extracts unique directories from changed files.
@@ -355,32 +477,6 @@ func (*ReviewerFinder) uniqueDirectories(files []ChangedFile) []string {
 	}
 
 	// Sort by depth (deeper first - more specific)
-	sortByDepth(dirs)
-
-	return dirs
-}
-
-// matchesPattern checks if a file path matches a CODEOWNERS pattern.
-func matchesPattern(path, pattern string) bool {
-	// Simplified pattern matching
-	if strings.HasPrefix(pattern, "*") {
-		return strings.HasSuffix(path, pattern[1:])
-	}
-	if strings.HasSuffix(pattern, "*") {
-		return strings.HasPrefix(path, pattern[:len(pattern)-1])
-	}
-	return path == pattern || strings.HasPrefix(path, pattern+"/")
-}
-
-// parseCodeOwners parses a CODEOWNERS file (simplified).
-func parseCodeOwners(_ io.Reader) map[string][]string {
-	// This is a simplified implementation
-	// Real implementation would properly parse the CODEOWNERS format
-	return nil
-}
-
-// sortByDepth sorts directories by depth (deeper first).
-func sortByDepth(dirs []string) {
 	for i := 0; i < len(dirs); i++ {
 		for j := i + 1; j < len(dirs); j++ {
 			if strings.Count(dirs[i], "/") < strings.Count(dirs[j], "/") {
@@ -388,6 +484,37 @@ func sortByDepth(dirs []string) {
 			}
 		}
 	}
+
+	return dirs
+}
+
+// matchesPattern checks if a file path matches a CODEOWNERS pattern.
+func matchesPattern(path, pattern string) bool {
+	// Handle wildcard patterns
+	if pattern == "*" {
+		return true
+	}
+
+	// Handle file extension patterns (e.g., *.js)
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(path, pattern[1:])
+	}
+
+	// Handle directory patterns
+	if strings.HasSuffix(pattern, "/") {
+		// Directory pattern (e.g., /src/components/)
+		dirPattern := strings.TrimPrefix(pattern, "/")
+		return strings.HasPrefix(path, dirPattern)
+	}
+
+	// Handle exact directory or prefix patterns
+	pattern = strings.TrimPrefix(pattern, "/")
+	if path == pattern {
+		return true
+	}
+
+	// Check if path is inside the directory
+	return strings.HasPrefix(path, pattern+"/")
 }
 
 // checkFileHistory checks the history and blame for specific changed files.

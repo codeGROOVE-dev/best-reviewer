@@ -248,8 +248,13 @@ func (rf *ReviewerFinder) collectWeightedCandidates(ctx context.Context, pr *Pul
 
 // countLinesInPatch counts the number of added/modified lines in a patch.
 func (*ReviewerFinder) countLinesInPatch(patch string) int {
-	lines := parsePatchForLineCount(patch)
-	return lines
+	lineCount := 0
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			lineCount++
+		}
+	}
+	return lineCount
 }
 
 // recentContributors gets contributors who have been active in the last N days.
@@ -402,7 +407,29 @@ func (rf *ReviewerFinder) performWeightedSelection(
 
 // recentPRsSince fetches PRs merged since the given date.
 func (rf *ReviewerFinder) recentPRsSince(ctx context.Context, owner, repo string, since time.Time) ([]PRInfo, error) {
-	query := `
+	query := rf.buildRecentPRsQuery()
+	variables := map[string]any{
+		"owner": owner,
+		"repo":  repo,
+		"since": since.Format(time.RFC3339),
+	}
+
+	graphResult, err := rf.client.makeGraphQLRequest(ctx, query, variables)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes, err := rf.extractPRNodes(graphResult)
+	if err != nil {
+		return nil, err
+	}
+
+	return rf.parsePRNodes(nodes, since)
+}
+
+// buildRecentPRsQuery builds the GraphQL query for recent PRs.
+func (*ReviewerFinder) buildRecentPRsQuery() string {
+	return `
 	query($owner: String!, $repo: String!, $since: DateTime!) {
 		repository(owner: $owner, name: $repo) {
 			pullRequests(
@@ -437,19 +464,10 @@ func (rf *ReviewerFinder) recentPRsSince(ctx context.Context, owner, repo string
 			}
 		}
 	}`
+}
 
-	variables := map[string]any{
-		"owner": owner,
-		"repo":  repo,
-		"since": since.Format(time.RFC3339),
-	}
-
-	graphResult, err := rf.client.makeGraphQLRequest(ctx, query, variables)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse the GraphQL response
+// extractPRNodes extracts PR nodes from GraphQL response.
+func (*ReviewerFinder) extractPRNodes(graphResult map[string]any) ([]any, error) {
 	data, ok := graphResult["data"].(map[string]any)
 	if !ok {
 		return nil, errors.New("unexpected GraphQL response format")
@@ -470,83 +488,22 @@ func (rf *ReviewerFinder) recentPRsSince(ctx context.Context, owner, repo string
 		return nil, errors.New("nodes not found in pullRequests")
 	}
 
+	return nodes, nil
+}
+
+// parsePRNodes parses PR nodes into PRInfo structures.
+func (rf *ReviewerFinder) parsePRNodes(nodes []any, since time.Time) ([]PRInfo, error) {
 	var prs []PRInfo
+
 	for _, nodeAny := range nodes {
 		node, ok := nodeAny.(map[string]any)
 		if !ok {
 			continue
 		}
 
-		// Parse merged_at time
-		mergedAtStr, ok := node["mergedAt"].(string)
-		if !ok || mergedAtStr == "" {
+		pr, shouldSkip := rf.parseSinglePRNode(node, since)
+		if shouldSkip {
 			continue
-		}
-		mergedAt, err := time.Parse(time.RFC3339, mergedAtStr)
-		if err != nil {
-			continue
-		}
-
-		// Skip if merged before our cutoff
-		if mergedAt.Before(since) {
-			continue
-		}
-
-		number, ok := node["number"].(float64)
-		if !ok {
-			continue
-		}
-
-		pr := PRInfo{
-			Number:   int(number),
-			MergedAt: mergedAt,
-		}
-
-		// Get author
-		if author, ok := node["author"].(map[string]any); ok {
-			if login, ok := author["login"].(string); ok {
-				pr.Author = login
-			}
-		}
-
-		// Collect unique reviewers
-		reviewerMap := make(map[string]bool)
-
-		// From reviews
-		if reviews, ok := node["reviews"].(map[string]any); ok {
-			if reviewNodes, ok := reviews["nodes"].([]any); ok {
-				for _, reviewAny := range reviewNodes {
-					if review, ok := reviewAny.(map[string]any); ok {
-						if author, ok := review["author"].(map[string]any); ok {
-							if login, ok := author["login"].(string); ok && login != "" && login != pr.Author {
-								reviewerMap[login] = true
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// From timeline items
-		if timelineItems, ok := node["timelineItems"].(map[string]any); ok {
-			if timelineNodes, ok := timelineItems["nodes"].([]any); ok {
-				for _, itemAny := range timelineNodes {
-					if item, ok := itemAny.(map[string]any); ok {
-						state, ok := item["state"].(string)
-						if ok && state == "APPROVED" {
-							if author, ok := item["author"].(map[string]any); ok {
-								if login, ok := author["login"].(string); ok && login != "" && login != pr.Author {
-									reviewerMap[login] = true
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		for reviewer := range reviewerMap {
-			pr.Reviewers = append(pr.Reviewers, reviewer)
 		}
 
 		prs = append(prs, pr)
@@ -555,15 +512,133 @@ func (rf *ReviewerFinder) recentPRsSince(ctx context.Context, owner, repo string
 	return prs, nil
 }
 
-// parsePatchForLineCount counts the number of lines in a patch.
-func parsePatchForLineCount(patch string) int {
-	lineCount := 0
-	for _, line := range strings.Split(patch, "\n") {
-		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
-			lineCount++
+// parseSinglePRNode parses a single PR node.
+func (rf *ReviewerFinder) parseSinglePRNode(node map[string]any, since time.Time) (PRInfo, bool) {
+	mergedAt, ok := rf.extractMergedTime(node)
+	if !ok || mergedAt.Before(since) {
+		return PRInfo{}, true
+	}
+
+	number, ok := node["number"].(float64)
+	if !ok {
+		return PRInfo{}, true
+	}
+
+	pr := PRInfo{
+		Number:   int(number),
+		MergedAt: mergedAt,
+	}
+
+	pr.Author = rf.extractPRAuthor(node)
+	pr.Reviewers = rf.collectPRReviewers(node, pr.Author)
+
+	return pr, false
+}
+
+// extractMergedTime extracts the merged time from a PR node.
+func (*ReviewerFinder) extractMergedTime(node map[string]any) (time.Time, bool) {
+	mergedAtStr, ok := node["mergedAt"].(string)
+	if !ok || mergedAtStr == "" {
+		return time.Time{}, false
+	}
+
+	mergedAt, err := time.Parse(time.RFC3339, mergedAtStr)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return mergedAt, true
+}
+
+// extractPRAuthor extracts the author from a PR node.
+func (*ReviewerFinder) extractPRAuthor(node map[string]any) string {
+	author, ok := node["author"].(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	login, _ := author["login"].(string) //nolint:errcheck,revive // Intentionally ignoring type assertion check - returns empty string on failure
+	return login
+}
+
+// collectPRReviewers collects all unique reviewers from a PR node.
+func (rf *ReviewerFinder) collectPRReviewers(node map[string]any, prAuthor string) []string {
+	reviewerMap := make(map[string]bool)
+
+	rf.collectReviewersFromReviews(node, prAuthor, reviewerMap)
+	rf.collectReviewersFromTimeline(node, prAuthor, reviewerMap)
+
+	var reviewers []string
+	for reviewer := range reviewerMap {
+		reviewers = append(reviewers, reviewer)
+	}
+
+	return reviewers
+}
+
+// collectReviewersFromReviews collects reviewers from the reviews field.
+func (*ReviewerFinder) collectReviewersFromReviews(node map[string]any, prAuthor string, reviewerMap map[string]bool) {
+	reviews, ok := node["reviews"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	reviewNodes, ok := reviews["nodes"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, reviewAny := range reviewNodes {
+		review, ok := reviewAny.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		login, ok := author["login"].(string)
+		if ok && login != "" && login != prAuthor {
+			reviewerMap[login] = true
 		}
 	}
-	return lineCount
+}
+
+// collectReviewersFromTimeline collects reviewers from timeline items.
+func (*ReviewerFinder) collectReviewersFromTimeline(node map[string]any, prAuthor string, reviewerMap map[string]bool) {
+	timelineItems, ok := node["timelineItems"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	timelineNodes, ok := timelineItems["nodes"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, itemAny := range timelineNodes {
+		item, ok := itemAny.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		state, ok := item["state"].(string)
+		if !ok || state != "APPROVED" {
+			continue
+		}
+
+		author, ok := item["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		login, ok := author["login"].(string)
+		if ok && login != "" && login != prAuthor {
+			reviewerMap[login] = true
+		}
+	}
 }
 
 // makeCacheKey creates a cache key from components.

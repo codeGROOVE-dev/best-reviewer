@@ -21,7 +21,8 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 
 	log.Printf("[API] Executing GraphQL query: %s (size: %d chars)", queryType, querySize)
 	if len(variables) > 0 {
-		log.Printf("[GRAPHQL] Variables: %+v", variables)
+		// Log GraphQL query without exposing potentially sensitive variables
+		log.Printf("[GRAPHQL] Query type: %s, Variables count: %d", extractGraphQLQueryType(query), len(variables))
 	}
 	payload := map[string]any{
 		"query":     query,
@@ -308,7 +309,7 @@ func (*ReviewerFinder) parsePRsFromGraphQL(result map[string]any) ([]PRInfo, err
 		return nil, errors.New("history not found")
 	}
 
-	nodes, ok := nodesValue(history)
+	nodes, ok := sliceNodes(history)
 	if !ok {
 		return nil, errors.New("nodes not found")
 	}
@@ -326,7 +327,7 @@ func (*ReviewerFinder) parsePRsFromGraphQL(result map[string]any) ([]PRInfo, err
 			continue
 		}
 
-		prNodes, ok := nodesValue(associatedPRs)
+		prNodes, ok := sliceNodes(associatedPRs)
 		if !ok {
 			continue
 		}
@@ -367,7 +368,7 @@ func (*ReviewerFinder) parseProjectPRsFromGraphQL(result map[string]any) ([]PRIn
 		return nil, errors.New("pullRequests not found")
 	}
 
-	nodes, ok := nodesValue(pullRequests)
+	nodes, ok := sliceNodes(pullRequests)
 	if !ok {
 		return nil, errors.New("nodes not found")
 	}
@@ -420,7 +421,7 @@ func (*ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]any, targ
 		return nil, errors.New("history not found")
 	}
 
-	nodes, ok := nodesValue(history)
+	nodes, ok := sliceNodes(history)
 	if !ok {
 		return nil, errors.New("nodes not found")
 	}
@@ -437,7 +438,7 @@ func (*ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]any, targ
 			continue
 		}
 
-		prNodes, ok := nodesValue(associatedPRs)
+		prNodes, ok := sliceNodes(associatedPRs)
 		if !ok || len(prNodes) == 0 {
 			continue
 		}
@@ -454,7 +455,7 @@ func (*ReviewerFinder) parseHistoricalPRsFromGraphQL(result map[string]any, targ
 				continue
 			}
 
-			fileNodes, ok := nodesValue(files)
+			fileNodes, ok := sliceNodes(files)
 			if !ok {
 				continue
 			}
@@ -497,17 +498,13 @@ func mapValue(data map[string]any, key string) (map[string]any, bool) {
 	return m, ok
 }
 
-func sliceValue(data map[string]any, key string) ([]any, bool) {
-	val, ok := data[key]
+func sliceNodes(data map[string]any) ([]any, bool) {
+	val, ok := data[graphQLNodes]
 	if !ok {
 		return nil, false
 	}
 	s, ok := val.([]any)
 	return s, ok
-}
-
-func nodesValue(data map[string]any) ([]any, bool) {
-	return sliceValue(data, graphQLNodes)
 }
 
 func stringValue(data map[string]any, key string) (string, bool) {
@@ -519,15 +516,6 @@ func stringValue(data map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
-func floatValue(data map[string]any, key string) (float64, bool) {
-	val, ok := data[key]
-	if !ok {
-		return 0, false
-	}
-	f, ok := val.(float64)
-	return f, ok
-}
-
 func parsePRNode(pr map[string]any) *PRInfo {
 	// Skip if not merged
 	merged, ok := pr["merged"].(bool)
@@ -535,7 +523,11 @@ func parsePRNode(pr map[string]any) *PRInfo {
 		return nil
 	}
 
-	number, ok := floatValue(pr, "number")
+	val, ok := pr["number"]
+	if !ok {
+		return nil
+	}
+	number, ok := val.(float64)
 	if !ok {
 		return nil
 	}
@@ -572,7 +564,7 @@ func extractReviewers(pr map[string]any) []string {
 		return reviewers
 	}
 
-	reviewNodes, ok := nodesValue(reviews)
+	reviewNodes, ok := sliceNodes(reviews)
 	if !ok {
 		return reviewers
 	}
@@ -609,33 +601,39 @@ func extractGraphQLQueryType(query string) string {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "query(") {
-			// Extract the first field being queried
+			// Extract query type from lines
 			for i := 1; i < len(lines); i++ {
 				fieldLine := strings.TrimSpace(lines[i])
-				if fieldLine != "" && !strings.HasPrefix(fieldLine, "}") {
-					// Remove common prefixes and extract main object
-					if strings.Contains(fieldLine, "organization(") {
-						return "organization-repositories"
-					}
-					if strings.Contains(fieldLine, "repository(") {
-						if strings.Contains(query, "pullRequests") {
-							if strings.Contains(query, "history") {
-								return "repository-commit-history"
-							}
-							return "repository-pullrequests"
-						}
+				if fieldLine == "" || strings.HasPrefix(fieldLine, "}") {
+					continue
+				}
+
+				// Classify the field line
+				if strings.Contains(fieldLine, "organization(") {
+					return "organization-repositories"
+				}
+
+				if strings.Contains(fieldLine, "repository(") {
+					// Classify repository query
+					if !strings.Contains(query, "pullRequests") {
 						return "repository-query"
 					}
-					// Extract the main field name
-					if idx := strings.Index(fieldLine, "("); idx != -1 {
-						return strings.TrimSpace(fieldLine[:idx])
+					if strings.Contains(query, "history") {
+						return "repository-commit-history"
 					}
-					if idx := strings.Index(fieldLine, " "); idx != -1 {
-						return strings.TrimSpace(fieldLine[:idx])
-					}
-					return fieldLine
+					return "repository-pullrequests"
 				}
+
+				// Extract the main field name
+				if idx := strings.Index(fieldLine, "("); idx != -1 {
+					return strings.TrimSpace(fieldLine[:idx])
+				}
+				if idx := strings.Index(fieldLine, " "); idx != -1 {
+					return strings.TrimSpace(fieldLine[:idx])
+				}
+				return fieldLine
 			}
+			return "unknown-query"
 		}
 	}
 

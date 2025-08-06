@@ -111,7 +111,11 @@ func (s *SimplifiedScorer) calculateFileOverlap(ctx context.Context, pr *PullReq
 	}
 
 	// Normalize to 0-1 range
-	return minFloat(overlap/float64(totalChanges), 1.0)
+	normalized := overlap / float64(totalChanges)
+	if normalized < 1.0 {
+		return normalized
+	}
+	return 1.0
 }
 
 // calculateRecencyScore calculates a score based on how recently the contributor was active.
@@ -324,12 +328,4 @@ func (rf *ReviewerFinder) topContributors(ctx context.Context, owner, repo strin
 	rf.client.cache.setWithTTL(cacheKey, contributors, repoContributorsCacheTTL)
 
 	return contributors
-}
-
-// min returns the minimum of two float64 values.
-func minFloat(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }
