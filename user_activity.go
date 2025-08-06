@@ -1,0 +1,320 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+)
+
+// UserActivity tracks a user's last activity in a repository.
+type UserActivity struct {
+	Username     string
+	LastActivity time.Time
+	Source       string // "commit", "pr_author", "pr_reviewer"
+}
+
+// fetchRepoUserActivity fetches all user activity for a repository in a single batch.
+func (rf *ReviewerFinder) fetchRepoUserActivity(ctx context.Context, owner, repo string) map[string]UserActivity {
+	// Check cache first
+	cacheKey := fmt.Sprintf("repo-user-activity:%s/%s", owner, repo)
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		if activities, ok := cached.(map[string]UserActivity); ok {
+			return activities
+		}
+	}
+
+	log.Printf("  📊 Fetching repository-wide user activity (single batch query)")
+
+	activities := make(map[string]UserActivity)
+
+	// Use GraphQL to get all recent activity in one query
+	query := `
+	query($owner: String!, $repo: String!) {
+		repository(owner: $owner, name: $repo) {
+			# Recent PRs (both open and merged)
+			pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+				nodes {
+					number
+					author { 
+						login
+						__typename
+					}
+					updatedAt
+					mergedAt
+					createdAt
+					participants(first: 50) {
+						nodes { 
+							login
+							__typename
+						}
+					}
+					reviews(first: 50) {
+						nodes {
+							author { 
+								login
+								__typename
+							}
+							submittedAt
+						}
+					}
+					timelineItems(first: 100, itemTypes: [PULL_REQUEST_COMMIT, PULL_REQUEST_REVIEW, ISSUE_COMMENT]) {
+						nodes {
+							__typename
+							... on PullRequestCommit {
+								commit {
+									author { 
+										user { 
+											login
+											__typename
+										}
+									}
+									committedDate
+								}
+							}
+							... on PullRequestReview {
+								author { 
+									login
+									__typename
+								}
+								submittedAt
+							}
+							... on IssueComment {
+								author { 
+									login
+									__typename
+								}
+								createdAt
+							}
+						}
+					}
+				}
+			}
+			
+			# Recent issues for additional activity
+			issues(first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+				nodes {
+					author { 
+						login
+						__typename
+					}
+					updatedAt
+					participants(first: 20) {
+						nodes { 
+							login
+							__typename
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	variables := map[string]any{
+		"owner": owner,
+		"repo":  repo,
+	}
+
+	result, err := rf.client.makeGraphQLRequest(ctx, query, variables)
+	if err != nil {
+		log.Printf("  ⚠️  Failed to fetch user activity: %v", err)
+		return activities
+	}
+
+	// Parse the result
+	rf.parseUserActivity(result, activities)
+
+	// Log summary
+	activeCount := 0
+	for _, activity := range activities {
+		daysSince := int(time.Since(activity.LastActivity).Hours() / 24)
+		if daysSince <= 30 {
+			activeCount++
+		}
+	}
+	log.Printf("  ✅ Found %d total users, %d active in last 30 days", len(activities), activeCount)
+
+	// Cache for 4 hours (same as contributors cache)
+	rf.client.cache.setWithTTL(cacheKey, activities, repoContributorsCacheTTL)
+
+	return activities
+}
+
+// parseUserActivity parses GraphQL result into user activities.
+func (rf *ReviewerFinder) parseUserActivity(result map[string]any, activities map[string]UserActivity) {
+	data, ok := result["data"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	repository, ok := data["repository"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	// Parse pull requests
+	if pullRequests, ok := repository["pullRequests"].(map[string]any); ok {
+		if nodes, ok := pullRequests["nodes"].([]any); ok {
+			for _, node := range nodes {
+				rf.parsePRNode(node, activities)
+			}
+		}
+	}
+
+	// Parse issues
+	if issues, ok := repository["issues"].(map[string]any); ok {
+		if nodes, ok := issues["nodes"].([]any); ok {
+			for _, node := range nodes {
+				rf.parseIssueNode(node, activities)
+			}
+		}
+	}
+}
+
+// parsePRNode parses a single PR node for user activity.
+func (rf *ReviewerFinder) parsePRNode(node any, activities map[string]UserActivity) {
+	pr, ok := node.(map[string]any)
+	if !ok {
+		return
+	}
+
+	// Get PR dates
+	var prDate time.Time
+	if mergedAtStr, ok := pr["mergedAt"].(string); ok && mergedAtStr != "" {
+		if t, err := time.Parse(time.RFC3339, mergedAtStr); err == nil {
+			prDate = t
+		}
+	} else if updatedAtStr, ok := pr["updatedAt"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
+			prDate = t
+		}
+	}
+
+	// Track PR author
+	if author, ok := pr["author"].(map[string]any); ok {
+		if login, ok := author["login"].(string); ok && login != "" {
+			// Cache the user type
+			if typeName, ok := author["__typename"].(string); ok {
+				rf.client.cacheUserTypeFromGraphQL(login, typeName)
+				if typeName == "Bot" {
+					return // Skip bots
+				}
+			}
+			// Also check username patterns for bots that show as "User"
+			if isLikelyBot(login) {
+				rf.client.cacheUserTypeFromGraphQL(login, "Bot") // Cache as bot
+				return                                           // Skip likely bots
+			}
+			rf.updateUserActivity(activities, login, prDate, "pr_author")
+		}
+	}
+
+	// Track reviewers
+	if reviews, ok := pr["reviews"].(map[string]any); ok {
+		if reviewNodes, ok := reviews["nodes"].([]any); ok {
+			for _, reviewNode := range reviewNodes {
+				if review, ok := reviewNode.(map[string]any); ok {
+					if author, ok := review["author"].(map[string]any); ok {
+						if login, ok := author["login"].(string); ok && login != "" {
+							// Check if it's a bot
+							if typeName, ok := author["__typename"].(string); ok && typeName == "Bot" {
+								continue // Skip bots
+							}
+							// Also check username patterns
+							if isLikelyBot(login) {
+								continue // Skip likely bots
+							}
+							var reviewDate time.Time
+							if submittedAtStr, ok := review["submittedAt"].(string); ok {
+								if t, err := time.Parse(time.RFC3339, submittedAtStr); err == nil {
+									reviewDate = t
+								}
+							}
+							rf.updateUserActivity(activities, login, reviewDate, "pr_reviewer")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Track participants
+	if participants, ok := pr["participants"].(map[string]any); ok {
+		if participantNodes, ok := participants["nodes"].([]any); ok {
+			for _, participantNode := range participantNodes {
+				if participant, ok := participantNode.(map[string]any); ok {
+					if login, ok := participant["login"].(string); ok && login != "" {
+						// Check if it's a bot
+						if typeName, ok := participant["__typename"].(string); ok && typeName == "Bot" {
+							continue // Skip bots
+						}
+						// Also check username patterns
+						if isLikelyBot(login) {
+							continue // Skip likely bots
+						}
+						rf.updateUserActivity(activities, login, prDate, "participant")
+					}
+				}
+			}
+		}
+	}
+}
+
+// parseIssueNode parses a single issue node for user activity.
+func (rf *ReviewerFinder) parseIssueNode(node any, activities map[string]UserActivity) {
+	issue, ok := node.(map[string]any)
+	if !ok {
+		return
+	}
+
+	var issueDate time.Time
+	if updatedAtStr, ok := issue["updatedAt"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
+			issueDate = t
+		}
+	}
+
+	// Track issue author
+	if author, ok := issue["author"].(map[string]any); ok {
+		if login, ok := author["login"].(string); ok && login != "" {
+			rf.updateUserActivity(activities, login, issueDate, "issue_author")
+		}
+	}
+
+	// Track participants
+	if participants, ok := issue["participants"].(map[string]any); ok {
+		if participantNodes, ok := participants["nodes"].([]any); ok {
+			for _, participantNode := range participantNodes {
+				if participant, ok := participantNode.(map[string]any); ok {
+					if login, ok := participant["login"].(string); ok && login != "" {
+						rf.updateUserActivity(activities, login, issueDate, "participant")
+					}
+				}
+			}
+		}
+	}
+}
+
+// updateUserActivity updates or creates a user activity record.
+func (rf *ReviewerFinder) updateUserActivity(activities map[string]UserActivity, username string, date time.Time, source string) {
+	if username == "" || date.IsZero() {
+		return
+	}
+
+	if existing, exists := activities[username]; exists {
+		// Update if this activity is more recent
+		if date.After(existing.LastActivity) {
+			activities[username] = UserActivity{
+				Username:     username,
+				LastActivity: date,
+				Source:       source,
+			}
+		}
+	} else {
+		activities[username] = UserActivity{
+			Username:     username,
+			LastActivity: date,
+			Source:       source,
+		}
+	}
+}

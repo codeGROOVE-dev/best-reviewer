@@ -1,0 +1,331 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sort"
+	"strings"
+	"time"
+)
+
+// SimplifiedScorer provides deterministic scoring for reviewer candidates.
+type SimplifiedScorer struct {
+	rf *ReviewerFinder
+}
+
+// ReviewerScore represents a scored reviewer candidate.
+type ReviewerScore struct {
+	Username string
+	Score    float64
+	Factors  map[string]float64 // For debugging/transparency
+}
+
+// scoreContributors scores a list of contributors for their suitability as reviewers.
+func (s *SimplifiedScorer) scoreContributors(ctx context.Context, pr *PullRequest, contributors []Contributor) []ReviewerScore {
+	var scores []ReviewerScore
+
+	for _, contributor := range contributors {
+		if contributor.Login == pr.Author {
+			continue
+		}
+
+		score := s.scoreReviewer(ctx, pr, contributor)
+		if score.Score > 0 {
+			scores = append(scores, score)
+		}
+	}
+
+	// Sort by score (highest first)
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].Score > scores[j].Score
+	})
+
+	// Log top candidates for transparency
+	for i, score := range scores {
+		if i >= topCandidatesToLog {
+			break
+		}
+		log.Printf("    Candidate %d: %s (score: %.2f | overlap: %.1f, recency: %.1f, expertise: %.1f)",
+			i+1, score.Username, score.Score,
+			score.Factors["file_overlap"], score.Factors["recency"], score.Factors["expertise"])
+	}
+
+	return scores
+}
+
+// scoreReviewer calculates a deterministic score for a potential reviewer.
+func (s *SimplifiedScorer) scoreReviewer(ctx context.Context, pr *PullRequest, contributor Contributor) ReviewerScore {
+	score := ReviewerScore{
+		Username: contributor.Login,
+		Factors:  make(map[string]float64),
+	}
+
+	// Factor 1: File overlap (how many of the changed files they've touched)
+	fileOverlap := s.calculateFileOverlap(ctx, pr, contributor)
+	score.Factors["file_overlap"] = fileOverlap * fileOverlapWeight
+
+	// Factor 2: Recency (when they last contributed)
+	recency := s.calculateRecencyScore(contributor.LastActivity)
+	score.Factors["recency"] = recency * recencyWeight
+
+	// Factor 3: Domain expertise (previous reviews in same area)
+	expertise := s.calculateDomainExpertise(ctx, pr, contributor)
+	score.Factors["expertise"] = expertise * expertiseWeight
+
+	// Calculate total score
+	score.Score = score.Factors["file_overlap"] +
+		score.Factors["recency"] +
+		score.Factors["expertise"]
+
+	return score
+}
+
+// calculateFileOverlap calculates how much the contributor has worked on the changed files.
+func (s *SimplifiedScorer) calculateFileOverlap(ctx context.Context, pr *PullRequest, contributor Contributor) float64 {
+	if len(pr.ChangedFiles) == 0 {
+		return 0
+	}
+
+	overlap := 0.0
+	totalChanges := 0
+
+	// Weight files by significance
+	fileWeights := s.fileWeights(pr.ChangedFiles)
+
+	for _, file := range pr.ChangedFiles {
+		weight := fileWeights[file.Filename]
+		totalChanges += file.Additions + file.Deletions
+
+		// Check if contributor has touched this file recently
+		if s.hasContributorTouchedFile(ctx, pr.Owner, pr.Repository, contributor.Login, file.Filename) {
+			overlap += weight * float64(file.Additions+file.Deletions)
+		}
+	}
+
+	if totalChanges == 0 {
+		return 0
+	}
+
+	// Normalize to 0-1 range
+	return min(overlap/float64(totalChanges), 1.0)
+}
+
+// calculateRecencyScore calculates a score based on how recently the contributor was active.
+func (s *SimplifiedScorer) calculateRecencyScore(lastActivity time.Time) float64 {
+	daysSince := time.Since(lastActivity).Hours() / 24
+
+	// More aggressive decay for inactive users
+	switch {
+	case daysSince <= 1:
+		return 1.0 // Active today/yesterday
+	case daysSince <= 3:
+		return 0.9 // Very recent
+	case daysSince <= 7:
+		return 0.7 // Past week
+	case daysSince <= 14:
+		return 0.5 // Past two weeks
+	case daysSince <= 30:
+		return 0.25 // Past month
+	case daysSince <= 60:
+		return 0.1 // Past two months
+	case daysSince <= 90:
+		return 0.05 // Past three months
+	default:
+		return 0.0 // No score for very old activity
+	}
+}
+
+// calculateDomainExpertise calculates expertise based on previous reviews in the same domain.
+func (s *SimplifiedScorer) calculateDomainExpertise(ctx context.Context, pr *PullRequest, contributor Contributor) float64 {
+	// Get directories from changed files
+	dirs := s.rf.uniqueDirectories(pr.ChangedFiles)
+	if len(dirs) == 0 {
+		return 0
+	}
+
+	primaryDir := dirs[0] // Most specific directory
+
+	// Check cache for domain expertise
+	cacheKey := makeCacheKey("domain-expertise", pr.Owner, pr.Repository, contributor.Login, primaryDir)
+	if cached, found := s.rf.client.cache.value(cacheKey); found {
+		if score, ok := cached.(float64); ok {
+			return score
+		}
+	}
+
+	// Calculate expertise score
+	expertiseScore := s.calculateDirectoryExpertise(ctx, pr.Owner, pr.Repository, contributor.Login, primaryDir)
+
+	// Cache the result
+	s.rf.client.cache.setWithTTL(cacheKey, expertiseScore, directoryOwnersCacheTTL)
+
+	return expertiseScore
+}
+
+// calculateDirectoryExpertise calculates how much expertise a user has in a directory.
+func (s *SimplifiedScorer) calculateDirectoryExpertise(ctx context.Context, owner, repo, user, dir string) float64 {
+	// This would query for the user's review history in this directory
+	// For now, returning a simplified score
+	return 0.5
+}
+
+// fileWeights calculates significance weights for changed files.
+func (s *SimplifiedScorer) fileWeights(files []ChangedFile) map[string]float64 {
+	weights := make(map[string]float64)
+
+	for _, file := range files {
+		weight := 1.0
+
+		// Boost production code over test code
+		if strings.HasSuffix(file.Filename, ".go") && !strings.HasSuffix(file.Filename, "_test.go") {
+			weight *= prodCodeMultiplier
+		}
+
+		// Boost critical files
+		if s.isCriticalFile(file.Filename) {
+			weight *= criticalFileMultiplier
+		}
+
+		// Boost refactoring (more deletions than additions)
+		if file.Deletions > file.Additions {
+			weight *= refactoringMultiplier
+		}
+
+		weights[file.Filename] = weight
+	}
+
+	return weights
+}
+
+// isCriticalFile determines if a file is critical based on patterns.
+func (s *SimplifiedScorer) isCriticalFile(filename string) bool {
+	criticalPatterns := []string{
+		"main.go",
+		"handler",
+		"server",
+		"auth",
+		"security",
+		"payment",
+		"database",
+		"migration",
+	}
+
+	lower := strings.ToLower(filename)
+	for _, pattern := range criticalPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasContributorTouchedFile checks if a contributor has recently touched a file.
+func (s *SimplifiedScorer) hasContributorTouchedFile(ctx context.Context, owner, repo, user, file string) bool {
+	// Check cache first
+	cacheKey := makeCacheKey("user-file-touch", owner, repo, user, file)
+	if cached, found := s.rf.client.cache.value(cacheKey); found {
+		if touched, ok := cached.(bool); ok {
+			return touched
+		}
+	}
+
+	// This would check commit history for the file
+	// For now, returning a simplified check
+	touched := false // Would be determined by API call
+
+	// Cache the result
+	s.rf.client.cache.setWithTTL(cacheKey, touched, fileHistoryCacheTTL)
+
+	return touched
+}
+
+// Contributor represents a repository contributor.
+type Contributor struct {
+	Login        string
+	Commits      int
+	LastActivity time.Time
+}
+
+// topContributors fetches the top contributors for a repository.
+func (rf *ReviewerFinder) topContributors(ctx context.Context, owner, repo string) []Contributor {
+	// Check cache first
+	cacheKey := makeCacheKey("top-contributors", owner, repo)
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		if contributors, ok := cached.([]Contributor); ok {
+			return contributors
+		}
+	}
+
+	log.Printf("  [API] Fetching top contributors for %s/%s", owner, repo)
+
+	// First, get all user activity in a single batch
+	userActivities := rf.fetchRepoUserActivity(ctx, owner, repo)
+
+	// Fetch from GitHub API
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contributors?per_page=30", owner, repo)
+	resp, err := rf.client.makeRequest(ctx, "GET", url, nil)
+	if err != nil {
+		log.Printf("  ⚠️  Failed to fetch contributors: %v", err)
+		return nil
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	var apiContributors []struct {
+		Login         string `json:"login"`
+		Contributions int    `json:"contributions"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&apiContributors); err != nil {
+		log.Printf("  ⚠️  Failed to decode contributors: %v", err)
+		return nil
+	}
+
+	// Convert to our format using pre-fetched activity data
+	contributors := make([]Contributor, 0, len(apiContributors))
+	for _, ac := range apiContributors {
+		// Get last activity from pre-fetched data
+		var lastActivity time.Time
+		if activity, exists := userActivities[ac.Login]; exists {
+			lastActivity = activity.LastActivity
+			daysSince := int(time.Since(lastActivity).Hours() / 24)
+			log.Printf("    📅 %s last active %d days ago (%s)", ac.Login, daysSince, activity.Source)
+		} else {
+			// No recent activity found
+			lastActivity = time.Now().Add(-365 * 24 * time.Hour) // Default to 1 year ago
+			log.Printf("    ⚠️  No recent activity found for %s", ac.Login)
+		}
+
+		// Filter out users who haven't been active in over 90 days
+		daysSince := time.Since(lastActivity).Hours() / 24
+		if daysSince > 90 {
+			log.Printf("    ⏭️  Skipping %s (inactive for %d days)", ac.Login, int(daysSince))
+			continue
+		}
+
+		contributors = append(contributors, Contributor{
+			Login:        ac.Login,
+			Commits:      ac.Contributions,
+			LastActivity: lastActivity,
+		})
+	}
+
+	// Cache the result with shorter TTL for catching returning contributors
+	rf.client.cache.setWithTTL(cacheKey, contributors, repoContributorsCacheTTL)
+
+	return contributors
+}
+
+// min returns the minimum of two float64 values.
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
