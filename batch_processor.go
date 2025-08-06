@@ -82,7 +82,7 @@ func (rf *ReviewerFinder) processPRsBatch(ctx context.Context, prs []*PullReques
 }
 
 // groupPRsByRepository groups PRs by their repository.
-func (rf *ReviewerFinder) groupPRsByRepository(prs []*PullRequest) []RepoGroup {
+func (*ReviewerFinder) groupPRsByRepository(prs []*PullRequest) []RepoGroup {
 	groupMap := make(map[string]*RepoGroup)
 
 	for _, pr := range prs {
@@ -135,16 +135,16 @@ func (rf *ReviewerFinder) prefetchRepositoryData(ctx context.Context, owner, rep
 	// Placeholder for future repository statistics
 	go func() {
 		// This could fetch repository-wide statistics in the future
-		log.Printf("    ✓ Repository context loaded")
+		log.Print("    ✓ Repository context loaded")
 		done <- true
 	}()
 
 	// Wait for all fetches to complete
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		<-done
 	}
 
-	log.Printf("  ✅ Repository data pre-fetched and cached")
+	log.Print("  ✅ Repository data pre-fetched and cached")
 }
 
 // Enhanced prsForOrg that returns PRs without individual fetching.
@@ -153,9 +153,9 @@ func (rf *ReviewerFinder) prsForOrgBatched(ctx context.Context, org string) ([]*
 
 	// Try different batch sizes if queries fail
 	batchSizes := []struct{ repos, prs int }{
-		{20, 20}, // Default optimized size
-		{10, 10}, // Smaller if first fails
-		{5, 5},   // Even smaller
+		{defaultBatchSize, defaultBatchSize}, // Default optimized size
+		{smallBatchSize, smallBatchSize},     // Smaller if first fails
+		{minBatchSize, minBatchSize},         // Even smaller
 	}
 
 	var lastErr error
@@ -240,10 +240,10 @@ func (rf *ReviewerFinder) prsForOrgWithBatchSize(ctx context.Context, org string
 		}
 
 		// Parse the GraphQL response
-		prs, hasNext, nextCursor := rf.parseOrgPRsFromGraphQL(result)
+		prs, hasNextPage, nextCursor := rf.parseOrgPRsFromGraphQL(result)
 		allPRs = append(allPRs, prs...)
 
-		if !hasNext {
+		if !hasNextPage {
 			break
 		}
 		cursor = nextCursor
@@ -254,10 +254,7 @@ func (rf *ReviewerFinder) prsForOrgWithBatchSize(ctx context.Context, org string
 }
 
 // parseOrgPRsFromGraphQL parses PRs from GraphQL response.
-func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) ([]*PullRequest, bool, string) {
-	var prs []*PullRequest
-	hasNext := false
-	cursor := ""
+func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) (prs []*PullRequest, hasNextPage bool, cursor string) {
 
 	// Navigate through the GraphQL response structure
 	if data, ok := result["data"].(map[string]any); ok {
@@ -266,7 +263,7 @@ func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) ([]*Pull
 				// Get pagination info
 				if pageInfo, ok := repos["pageInfo"].(map[string]any); ok {
 					if next, ok := pageInfo["hasNextPage"].(bool); ok {
-						hasNext = next
+						hasNextPage = next
 					}
 					if endCursor, ok := pageInfo["endCursor"].(string); ok {
 						cursor = endCursor
@@ -285,7 +282,7 @@ func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) ([]*Pull
 		}
 	}
 
-	return prs, hasNext, cursor
+	return prs, hasNextPage, cursor
 }
 
 // parsePRsFromRepo parses PRs from a repository node.

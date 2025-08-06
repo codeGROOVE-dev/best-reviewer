@@ -79,4 +79,45 @@ const (
 
 	// GraphQL constants.
 	graphQLNodes = "nodes" // Common GraphQL field name
+
+	// HTTP constants.
+	httpMethodGet = "GET" // HTTP GET method
+
+	// Scoring constants.
+	recentActivityScore      = 0.9  // Score for very recent activity (< 3 days)
+	weekActivityScore        = 0.7  // Score for weekly activity (< 7 days)
+	biweeklyActivityScore    = 0.5  // Score for biweekly activity (< 14 days)
+	monthlyActivityScore     = 0.25 // Score for monthly activity (< 30 days)
+	bimonthlyActivityScore   = 0.1  // Score for bimonthly activity (< 60 days)
+	quarterlyActivityScore   = 0.05 // Score for quarterly activity (< 90 days)
+	defaultExpertiseScore    = 0.5  // Default expertise score
+	reviewerWeightMultiplier = 0.5  // Weight multiplier for reviewers vs authors
+
+	// Overlap scoring constants.
+	contextMatchWeight = 0.7 // Weight for context matches in overlap scoring
+	minOverlapThreshold = 5.0 // Minimum overlap score threshold
+
+	// Analysis limits.
+	maxRecentCommits       = 10 // Maximum recent commits to analyze
+	maxDirectoryReviewers  = 5  // Maximum directory reviewers to return
+
+	// Batch processing sizes.
+	defaultBatchSize = 20 // Default batch size for processing
+	smallBatchSize   = 10 // Small batch size fallback
+	minBatchSize     = 5  // Minimum batch size
+
+	// Selection method scoring.
+	overlapAuthorScore     = 30 // Score for author overlap
+	overlapReviewerScore   = 25 // Score for reviewer overlap
+	fileAuthorScore        = 15 // Score for file author
+	fileReviewerScore      = 12 // Score for file reviewer
+	directoryAuthorScore   = 7  // Score for directory author
+	directoryReviewerScore = 5  // Score for directory reviewer
+
+	// Time-based constants.
+	recentDaysThreshold    = 7  // Days threshold for recent activity
+	biweeklyDaysThreshold  = 14 // Days threshold for biweekly activity
+	monthlyDaysThreshold   = 30 // Days threshold for monthly activity
+	bimonthlyDaysThreshold = 60 // Days threshold for bimonthly activity
+	quarterlyDaysThreshold = 90 // Days threshold for quarterly activity
 )

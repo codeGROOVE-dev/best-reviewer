@@ -16,6 +16,8 @@ type SimplifiedScorer struct {
 }
 
 // ReviewerScore represents a scored reviewer candidate.
+//
+//nolint:govet // Field alignment optimization not worth the readability cost
 type ReviewerScore struct {
 	Username string
 	Score    float64
@@ -109,11 +111,11 @@ func (s *SimplifiedScorer) calculateFileOverlap(ctx context.Context, pr *PullReq
 	}
 
 	// Normalize to 0-1 range
-	return min(overlap/float64(totalChanges), 1.0)
+	return minFloat(overlap/float64(totalChanges), 1.0)
 }
 
 // calculateRecencyScore calculates a score based on how recently the contributor was active.
-func (s *SimplifiedScorer) calculateRecencyScore(lastActivity time.Time) float64 {
+func (*SimplifiedScorer) calculateRecencyScore(lastActivity time.Time) float64 {
 	daysSince := time.Since(lastActivity).Hours() / 24
 
 	// More aggressive decay for inactive users
@@ -121,17 +123,17 @@ func (s *SimplifiedScorer) calculateRecencyScore(lastActivity time.Time) float64
 	case daysSince <= 1:
 		return 1.0 // Active today/yesterday
 	case daysSince <= 3:
-		return 0.9 // Very recent
-	case daysSince <= 7:
-		return 0.7 // Past week
-	case daysSince <= 14:
-		return 0.5 // Past two weeks
-	case daysSince <= 30:
-		return 0.25 // Past month
-	case daysSince <= 60:
-		return 0.1 // Past two months
-	case daysSince <= 90:
-		return 0.05 // Past three months
+		return recentActivityScore // Very recent
+	case daysSince <= recentDaysThreshold:
+		return weekActivityScore // Past week
+	case daysSince <= biweeklyDaysThreshold:
+		return biweeklyActivityScore // Past two weeks
+	case daysSince <= monthlyDaysThreshold:
+		return monthlyActivityScore // Past month
+	case daysSince <= bimonthlyDaysThreshold:
+		return bimonthlyActivityScore // Past two months
+	case daysSince <= quarterlyDaysThreshold:
+		return quarterlyActivityScore // Past three months
 	default:
 		return 0.0 // No score for very old activity
 	}
@@ -165,10 +167,10 @@ func (s *SimplifiedScorer) calculateDomainExpertise(ctx context.Context, pr *Pul
 }
 
 // calculateDirectoryExpertise calculates how much expertise a user has in a directory.
-func (s *SimplifiedScorer) calculateDirectoryExpertise(ctx context.Context, owner, repo, user, dir string) float64 {
+func (*SimplifiedScorer) calculateDirectoryExpertise(_ context.Context, _, _, _, _ string) float64 {
 	// This would query for the user's review history in this directory
 	// For now, returning a simplified score
-	return 0.5
+	return defaultExpertiseScore
 }
 
 // fileWeights calculates significance weights for changed files.
@@ -200,7 +202,7 @@ func (s *SimplifiedScorer) fileWeights(files []ChangedFile) map[string]float64 {
 }
 
 // isCriticalFile determines if a file is critical based on patterns.
-func (s *SimplifiedScorer) isCriticalFile(filename string) bool {
+func (*SimplifiedScorer) isCriticalFile(filename string) bool {
 	criticalPatterns := []string{
 		"main.go",
 		"handler",
@@ -223,7 +225,7 @@ func (s *SimplifiedScorer) isCriticalFile(filename string) bool {
 }
 
 // hasContributorTouchedFile checks if a contributor has recently touched a file.
-func (s *SimplifiedScorer) hasContributorTouchedFile(ctx context.Context, owner, repo, user, file string) bool {
+func (s *SimplifiedScorer) hasContributorTouchedFile(_ context.Context, owner, repo, user, file string) bool {
 	// Check cache first
 	cacheKey := makeCacheKey("user-file-touch", owner, repo, user, file)
 	if cached, found := s.rf.client.cache.value(cacheKey); found {
@@ -243,6 +245,8 @@ func (s *SimplifiedScorer) hasContributorTouchedFile(ctx context.Context, owner,
 }
 
 // Contributor represents a repository contributor.
+//
+//nolint:govet // Field alignment optimization not worth the readability cost
 type Contributor struct {
 	Login        string
 	Commits      int
@@ -266,7 +270,7 @@ func (rf *ReviewerFinder) topContributors(ctx context.Context, owner, repo strin
 
 	// Fetch from GitHub API
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contributors?per_page=30", owner, repo)
-	resp, err := rf.client.makeRequest(ctx, "GET", url, nil)
+	resp, err := rf.client.makeRequest(ctx, httpMethodGet, url, nil)
 	if err != nil {
 		log.Printf("  ⚠️  Failed to fetch contributors: %v", err)
 		return nil
@@ -304,7 +308,7 @@ func (rf *ReviewerFinder) topContributors(ctx context.Context, owner, repo strin
 
 		// Filter out users who haven't been active in over 90 days
 		daysSince := time.Since(lastActivity).Hours() / 24
-		if daysSince > 90 {
+		if daysSince > quarterlyDaysThreshold {
 			log.Printf("    ⏭️  Skipping %s (inactive for %d days)", ac.Login, int(daysSince))
 			continue
 		}
@@ -323,7 +327,7 @@ func (rf *ReviewerFinder) topContributors(ctx context.Context, owner, repo strin
 }
 
 // min returns the minimum of two float64 values.
-func min(a, b float64) float64 {
+func minFloat(a, b float64) float64 {
 	if a < b {
 		return a
 	}

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ type GitHubClient struct {
 	cache      *cache
 	userCache  *userCache
 	token      string
+	isAppAuth  bool // Whether using GitHub App authentication
 }
 
 // PullRequest represents a GitHub pull request.
@@ -67,17 +69,34 @@ type PRInfo struct {
 	Number    int
 }
 
-// newGitHubClient creates a new GitHub API client using gh auth token.
-func newGitHubClient(ctx context.Context) (*GitHubClient, error) {
-	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get GitHub token: %w", err)
-	}
+// newGitHubClient creates a new GitHub API client using gh auth token or GitHub App authentication.
+func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error) {
+	var token string
+	var isAppAuth bool
 
-	token := strings.TrimSpace(string(output))
-	if token == "" {
-		return nil, errors.New("no GitHub token found")
+	if useAppAuth {
+		// For GitHub App authentication, check for required environment variables
+		appToken := os.Getenv("GITHUB_APP_TOKEN")
+		if appToken == "" {
+			return nil, errors.New("GITHUB_APP_TOKEN environment variable is required for --app mode")
+		}
+		token = appToken
+		isAppAuth = true
+		log.Print("[AUTH] Using GitHub App authentication")
+	} else {
+		// Use gh CLI authentication
+		cmd := exec.CommandContext(ctx, "gh", "auth", "token")
+		output, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get GitHub token: %w", err)
+		}
+
+		token = strings.TrimSpace(string(output))
+		if token == "" {
+			return nil, errors.New("no GitHub token found")
+		}
+		isAppAuth = false
+		log.Print("[AUTH] Using gh CLI authentication")
 	}
 
 	c := &cache{
@@ -91,6 +110,7 @@ func newGitHubClient(ctx context.Context) (*GitHubClient, error) {
 		cache:      c,
 		userCache:  &userCache{users: make(map[string]*userInfo)},
 		token:      token,
+		isAppAuth:  isAppAuth,
 	}, nil
 }
 
@@ -114,8 +134,13 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		req.Header.Set("Authorization", "token "+c.token)
-		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		if c.isAppAuth {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+			req.Header.Set("Accept", "application/vnd.github.v3+json")
+		} else {
+			req.Header.Set("Authorization", "token "+c.token)
+			req.Header.Set("Accept", "application/vnd.github.v3+json")
+		}
 		if method == "PATCH" || method == "POST" || method == "PUT" {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -170,7 +195,7 @@ func (c *GitHubClient) pullRequestWithUpdatedAt(
 
 	log.Printf("[API] Fetching PR details for %s/%s#%d to get title, state, author, assignees, reviewers, and metadata", owner, repo, prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +312,7 @@ func (c *GitHubClient) openPullRequests(ctx context.Context, owner, repo string)
 
 		// Extract API call to avoid defer in loop
 		prs, shouldBreak, err := func() ([]json.RawMessage, bool, error) {
-			resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+			resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 			if err != nil {
 				return nil, false, err
 			}
@@ -346,7 +371,7 @@ func (c *GitHubClient) openPullRequests(ctx context.Context, owner, repo string)
 func (c *GitHubClient) changedFiles(ctx context.Context, owner, repo string, prNumber int) ([]ChangedFile, error) {
 	log.Printf("[API] Fetching changed files for PR %s/%s#%d to determine modified files for reviewer expertise matching", owner, repo, prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +409,7 @@ func (c *GitHubClient) changedFiles(ctx context.Context, owner, repo string, prN
 func (c *GitHubClient) lastCommitTime(ctx context.Context, owner, repo, sha string) (time.Time, error) {
 	log.Printf("[API] Fetching commit details for %s/%s@%s to get last commit timestamp for PR staleness analysis", owner, repo, sha)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", owner, repo, sha)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -413,7 +438,7 @@ func (c *GitHubClient) lastCommitTime(ctx context.Context, owner, repo, sha stri
 func (c *GitHubClient) lastReviewTime(ctx context.Context, owner, repo string, prNumber int) (time.Time, error) {
 	log.Printf("[API] Fetching review history for PR %s/%s#%d to determine last review timestamp for staleness detection", owner, repo, prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -637,7 +662,7 @@ func (c *GitHubClient) searchPRCount(ctx context.Context, query string) (int, er
 	apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=1", encodedQuery)
 	log.Printf("  [DEBUG] Search query: %s", query)
 	log.Printf("  [DEBUG] Full URL: %s", apiURL)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -663,4 +688,55 @@ func (c *GitHubClient) searchPRCount(ctx context.Context, query string) (int, er
 	}
 
 	return searchResult.TotalCount, nil
+}
+
+// Installation represents a GitHub App installation.
+//
+//nolint:govet // Field alignment optimization not worth the readability cost
+type Installation struct {
+	ID      int `json:"id"`
+	Account struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"account"`
+}
+
+// listAppInstallations returns all organizations where this GitHub app is installed.
+func (c *GitHubClient) listAppInstallations(ctx context.Context) ([]string, error) {
+	if !c.isAppAuth {
+		return nil, errors.New("app installations can only be listed with GitHub App authentication")
+	}
+
+	log.Print("[API] Fetching GitHub App installations")
+	apiURL := "https://api.github.com/app/installations"
+	resp, err := c.makeRequest(ctx, httpMethodGet, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get app installations: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to list installations (status %d)", resp.StatusCode)
+	}
+
+	var installations []Installation
+	if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
+		return nil, fmt.Errorf("failed to decode installations: %w", err)
+	}
+
+	var orgs []string
+	for _, installation := range installations {
+		// Only include organization accounts, not user accounts
+		if installation.Account.Type == "Organization" {
+			orgs = append(orgs, installation.Account.Login)
+			log.Printf("[APP] Found installation in org: %s (ID: %d)", installation.Account.Login, installation.ID)
+		}
+	}
+
+	log.Printf("[APP] Found %d organization installations", len(orgs))
+	return orgs, nil
 }

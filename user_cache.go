@@ -47,7 +47,7 @@ func (c *GitHubClient) userType(ctx context.Context, username string) (userType,
 	log.Printf("[USER] Fetching user type for: %s", username)
 	// Make API call to get user info
 	url := fmt.Sprintf("https://api.github.com/users/%s", username)
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, url, nil)
 	if err != nil {
 		return userTypeUser, err // Default to user on error
 	}

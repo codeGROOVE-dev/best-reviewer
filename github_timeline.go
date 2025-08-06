@@ -21,12 +21,15 @@ type TimelineEvent struct {
 }
 
 // reviewerRequestedTimes returns when each reviewer was requested for a PR.
+// Currently unused but maintained for future stale reviewer detection features.
+//
+//nolint:unused
 func (c *GitHubClient) reviewerRequestedTimes(ctx context.Context, owner, repo string, prNumber int) (map[string]time.Time, error) {
 	log.Printf("[TIMELINE] Fetching reviewer request times for PR %s/%s#%d", owner, repo, prNumber)
 	log.Printf("[API] Fetching timeline events for PR %s/%s#%d to determine reviewer request times for staleness detection", owner, repo, prNumber)
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%d/timeline", owner, repo, prNumber)
 
-	resp, err := c.makeRequest(ctx, "GET", url, nil)
+	resp, err := c.makeRequest(ctx, httpMethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get timeline: %w", err)
 	}
@@ -58,6 +61,9 @@ func (c *GitHubClient) reviewerRequestedTimes(ctx context.Context, owner, repo s
 }
 
 // staleReviewers returns reviewers who were requested over X days ago.
+// Currently unused but maintained for future stale reviewer detection features.
+//
+//nolint:unused
 func (c *GitHubClient) staleReviewers(ctx context.Context, pr *PullRequest, staleDuration time.Duration) ([]string, error) {
 	if len(pr.Reviewers) == 0 {
 		return nil, nil

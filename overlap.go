@@ -99,7 +99,7 @@ func (rf *ReviewerFinder) analyzeLineOverlaps(ctx context.Context, pr *PullReque
 		}
 
 		// Get historical PRs that modified this file - limit to 5 PRs per file
-		maxPRsToCheck := 5
+		maxPRsToCheck := maxHistoricalPRs
 		if maxHistoricalPRs < maxPRsToCheck {
 			maxPRsToCheck = maxHistoricalPRs
 		}
@@ -119,7 +119,7 @@ func (rf *ReviewerFinder) analyzeLineOverlaps(ctx context.Context, pr *PullReque
 			// Skip if we already have a high-scoring overlap for this PR
 			hasHighOverlap := false
 			for _, existing := range allOverlaps {
-				if existing.prNumber == histPR.Number && existing.overlapScore > 5.0 {
+				if existing.prNumber == histPR.Number && existing.overlapScore > minOverlapThreshold {
 					hasHighOverlap = true
 					break
 				}
@@ -199,6 +199,8 @@ func (rf *ReviewerFinder) calculatePROverlap(
 			contextMatches++ // Within our context window
 		case bestMatch <= nearbyLines:
 			nearbyMatches++
+		default:
+			// Line is too far away to be considered relevant
 		}
 	}
 
@@ -210,7 +212,7 @@ func (rf *ReviewerFinder) calculatePROverlap(
 
 	// Calculate score with different weights for each type
 	// Exact matches are most valuable, context matches are good, nearby are okay
-	score := float64(exactMatches)*1.0 + float64(contextMatches)*0.7 + float64(nearbyMatches)*0.3
+	score := float64(exactMatches)*1.0 + float64(contextMatches)*contextMatchWeight + float64(nearbyMatches)*nearbyMatchWeight
 
 	// Apply recency weight
 	daysSinceMerge := time.Since(histPR.MergedAt).Hours() / 24

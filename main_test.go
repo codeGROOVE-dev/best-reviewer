@@ -176,8 +176,8 @@ func TestParsePatchForChangedLines(t *testing.T) {
 -	removed line
  	another line`,
 			wantLines: map[int]bool{
-				10: true, 11: true, 12: true, 13: true,
-				14: true, 15: true, 16: true,
+				8: true, 9: true, 10: true, 11: true, 12: true,
+				13: true, 14: true, 15: true, 16: true, 17: true, 18: true,
 			},
 		},
 		{
@@ -188,8 +188,8 @@ func TestParsePatchForChangedLines(t *testing.T) {
 @@ -20,1 +21,2 @@
 +another add`,
 			wantLines: map[int]bool{
-				10: true, 11: true, 12: true,
-				21: true, 22: true,
+				8: true, 9: true, 10: true, 11: true, 12: true, 13: true, 14: true,
+				19: true, 20: true, 21: true, 22: true, 23: true, 24: true,
 			},
 		},
 	}

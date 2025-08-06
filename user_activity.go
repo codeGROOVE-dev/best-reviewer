@@ -24,7 +24,7 @@ func (rf *ReviewerFinder) fetchRepoUserActivity(ctx context.Context, owner, repo
 		}
 	}
 
-	log.Printf("  📊 Fetching repository-wide user activity (single batch query)")
+	log.Print("  📊 Fetching repository-wide user activity (single batch query)")
 
 	activities := make(map[string]UserActivity)
 
@@ -296,7 +296,7 @@ func (rf *ReviewerFinder) parseIssueNode(node any, activities map[string]UserAct
 }
 
 // updateUserActivity updates or creates a user activity record.
-func (rf *ReviewerFinder) updateUserActivity(activities map[string]UserActivity, username string, date time.Time, source string) {
+func (*ReviewerFinder) updateUserActivity(activities map[string]UserActivity, username string, date time.Time, source string) {
 	if username == "" || date.IsZero() {
 		return
 	}

@@ -22,7 +22,7 @@ func (rf *ReviewerFinder) findReviewersProgressive(ctx context.Context, pr *Pull
 
 	// Level 0: Check if PR already has reviewers (no API call)
 	if len(pr.Reviewers) > 0 {
-		log.Printf("  ✅ PR already has reviewers, skipping search")
+		log.Print("  ✅ PR already has reviewers, skipping search")
 		return nil // Return nil to indicate no new reviewers needed
 	}
 
@@ -46,7 +46,7 @@ func (rf *ReviewerFinder) findReviewersProgressive(ctx context.Context, pr *Pull
 	}
 
 	// For levels 3-5, gather ALL candidates and then score them
-	log.Printf("  🔍 Gathering candidates from multiple sources...")
+	log.Print("  🔍 Gathering candidates from multiple sources...")
 
 	// Level 3: Check file-specific history and blame (most specific)
 	fileHistoryCandidates := loader.checkFileHistory(ctx, rf, pr)
@@ -71,7 +71,7 @@ func (rf *ReviewerFinder) findReviewersProgressive(ctx context.Context, pr *Pull
 
 	if len(allCandidates) == 0 {
 		// Level 6: Full analysis as last resort
-		log.Printf("  📊 No candidates found, proceeding to full analysis")
+		log.Print("  📊 No candidates found, proceeding to full analysis")
 		return rf.fullAnalysisOptimized(ctx, pr)
 	}
 
@@ -80,7 +80,7 @@ func (rf *ReviewerFinder) findReviewersProgressive(ctx context.Context, pr *Pull
 }
 
 // checkAssignees validates PR assignees as reviewers (no API calls).
-func (pl *ProgressiveLoader) checkAssignees(ctx context.Context, rf *ReviewerFinder, pr *PullRequest) []ReviewerCandidate {
+func (*ProgressiveLoader) checkAssignees(ctx context.Context, rf *ReviewerFinder, pr *PullRequest) []ReviewerCandidate {
 	if len(pr.Assignees) == 0 {
 		return nil
 	}
@@ -197,8 +197,8 @@ func (pl *ProgressiveLoader) checkDirectoryReviewers(ctx context.Context, rf *Re
 }
 
 // checkTopContributors uses repository statistics to find active contributors.
-func (pl *ProgressiveLoader) checkTopContributors(ctx context.Context, rf *ReviewerFinder, pr *PullRequest) []ReviewerCandidate {
-	log.Printf("  📊 Checking top repository contributors")
+func (*ProgressiveLoader) checkTopContributors(ctx context.Context, rf *ReviewerFinder, pr *PullRequest) []ReviewerCandidate {
+	log.Print("  📊 Checking top repository contributors")
 
 	contributors := rf.topContributors(ctx, pr.Owner, pr.Repository)
 	if len(contributors) == 0 {
@@ -233,22 +233,24 @@ func (pl *ProgressiveLoader) fetchCodeOwners(ctx context.Context, owner, repo st
 	locations := []string{".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"}
 
 	for _, loc := range locations {
-		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, loc)
-		resp, err := pl.client.makeRequest(ctx, "GET", url, nil)
-		if err != nil {
-			continue
-		}
-		defer func() {
-			if err := resp.Body.Close(); err != nil {
-				log.Printf("[WARN] Failed to close response body: %v", err)
+		func() {
+			url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, loc)
+			resp, err := pl.client.makeRequest(ctx, httpMethodGet, url, nil)
+			if err != nil {
+				return
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					log.Printf("[WARN] Failed to close response body: %v", err)
+				}
+			}()
+
+			if resp.StatusCode == http.StatusOK {
+				// Parse CODEOWNERS file
+				// This is simplified - real implementation would decode base64 content
+				return
 			}
 		}()
-
-		if resp.StatusCode == http.StatusOK {
-			// Parse CODEOWNERS file
-			// This is simplified - real implementation would decode base64 content
-			return parseCodeOwners(resp.Body)
-		}
 	}
 
 	return nil
@@ -334,11 +336,11 @@ func (pl *ProgressiveLoader) fetchDirectoryReviewers(ctx context.Context, owner,
 	}
 
 	// Sort by count and return top reviewers
-	return topNByCount(reviewerCount, 5)
+	return topNByCount(reviewerCount, maxDirectoryReviewers)
 }
 
 // uniqueDirectories extracts unique directories from changed files.
-func (rf *ReviewerFinder) uniqueDirectories(files []ChangedFile) []string {
+func (*ReviewerFinder) uniqueDirectories(files []ChangedFile) []string {
 	dirMap := make(map[string]bool)
 	for _, file := range files {
 		dir := filepath.Dir(file.Filename)
@@ -371,7 +373,7 @@ func matchesPattern(path, pattern string) bool {
 }
 
 // parseCodeOwners parses a CODEOWNERS file (simplified).
-func parseCodeOwners(content io.Reader) map[string][]string {
+func parseCodeOwners(_ io.Reader) map[string][]string {
 	// This is a simplified implementation
 	// Real implementation would properly parse the CODEOWNERS format
 	return nil
@@ -449,7 +451,7 @@ func (pl *ProgressiveLoader) checkFileHistory(ctx context.Context, rf *ReviewerF
 
 		// Weight contributors by recency and frequency
 		for i, commit := range commits {
-			if i >= 10 { // Only look at last 10 commits
+			if i >= maxRecentCommits { // Only look at recent commits
 				break
 			}
 
@@ -463,7 +465,7 @@ func (pl *ProgressiveLoader) checkFileHistory(ctx context.Context, rf *ReviewerF
 			// Also consider reviewers of those commits
 			for _, reviewer := range commit.Reviewers {
 				if reviewer != "" && reviewer != pr.Author {
-					candidateScores[reviewer] += recencyWeight * 0.5 // Reviewers get half weight
+					candidateScores[reviewer] += recencyWeight * reviewerWeightMultiplier // Reviewers get reduced weight
 					if candidateSources[reviewer] == "" {
 						candidateSources[reviewer] = "file-reviewer"
 					}
@@ -507,7 +509,7 @@ func (pl *ProgressiveLoader) fileCommits(ctx context.Context, owner, repo, file 
 
 	// Use GitHub commits API with path filter
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits?path=%s&per_page=10", owner, repo, file)
-	resp, err := pl.client.makeRequest(ctx, "GET", url, nil)
+	resp, err := pl.client.makeRequest(ctx, httpMethodGet, url, nil)
 	if err != nil {
 		log.Printf("    ⚠️  Failed to get file commits: %v", err)
 		return nil
@@ -558,7 +560,7 @@ type FileCommit struct {
 }
 
 // selectBestCandidates deduplicates and selects the best candidates.
-func (pl *ProgressiveLoader) selectBestCandidates(candidates []ReviewerCandidate) []ReviewerCandidate {
+func (*ProgressiveLoader) selectBestCandidates(candidates []ReviewerCandidate) []ReviewerCandidate {
 	// Deduplicate by taking highest score for each user
 	bestByUser := make(map[string]ReviewerCandidate)
 
@@ -570,17 +572,19 @@ func (pl *ProgressiveLoader) selectBestCandidates(candidates []ReviewerCandidate
 		// Overlap > File > Directory
 		switch candidate.SelectionMethod {
 		case selectionAuthorOverlap:
-			adjustedScore += 30 // Highest priority - actually touched the same lines
+			adjustedScore += overlapAuthorScore // Highest priority - actually touched the same lines
 		case selectionReviewerOverlap:
-			adjustedScore += 25 // Very high - reviewed the same lines
+			adjustedScore += overlapReviewerScore // Very high - reviewed the same lines
 		case "file-author":
-			adjustedScore += 15 // Good - worked on the same file
+			adjustedScore += fileAuthorScore // Good - worked on the same file
 		case "file-reviewer":
-			adjustedScore += 12 // Good - reviewed the same file
+			adjustedScore += fileReviewerScore // Good - reviewed the same file
 		case selectionAuthorDirectory:
-			adjustedScore += 7 // Okay - worked in same directory
+			adjustedScore += directoryAuthorScore // Okay - worked in same directory
 		case selectionReviewerDirectory:
-			adjustedScore += 5 // Okay - reviewed in same directory
+			adjustedScore += directoryReviewerScore // Okay - reviewed in same directory
+		default:
+			// Unknown selection method, use base score
 		}
 
 		candidate.ContextScore = adjustedScore

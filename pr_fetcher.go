@@ -60,7 +60,7 @@ func (rf *ReviewerFinder) prsForOrg(ctx context.Context, org string) ([]*PullReq
 			Number        int    `json:"number"`
 		}, bool, error,
 		) {
-			resp, err := rf.client.makeRequest(ctx, "GET", url, nil)
+			resp, err := rf.client.makeRequest(ctx, httpMethodGet, url, nil)
 			if err != nil {
 				return nil, false, fmt.Errorf("failed to search org PRs: %w", err)
 			}

@@ -4,12 +4,16 @@ A Go program that intelligently finds and assigns reviewers for GitHub pull requ
 
 ## Features
 
-- **Context-based reviewer selection**: Finds reviewers who have previously worked on the lines being changed
-- **Activity-based reviewer selection**: Identifies reviewers who have been active on similar files
-- **Configurable time constraints**: Only processes PRs within specified age ranges
-- **Dry-run mode**: Test the logic without actually assigning reviewers
-- **Polling support**: Continuously monitor repositories for new PRs
-- **Comprehensive logging**: Detailed logs to understand reviewer selection decisions
+- **Smart reviewer selection**: Context-based matching using code blame analysis and activity patterns
+- **Workload balancing**: Filters out overloaded reviewers (>9 non-stale open PRs) 
+- **Stale PR filtering**: Only counts PRs updated within 90 days for accurate workload assessment
+- **Resilient API handling**: 25 retry attempts with exponential backoff (5s-20min) and intelligent caching
+- **Bot detection**: Comprehensive filtering of bots, service accounts, and organizations
+- **Multiple targets**: Single PR, project-wide, or organization-wide monitoring
+- **Polling support**: Continuous monitoring with configurable intervals
+- **Graceful degradation**: Continues operation even when secondary features fail
+- **Comprehensive logging**: Detailed decision tracking and performance insights
+- **Dry-run mode**: Test assignments without making changes
 
 ## Installation
 
@@ -20,7 +24,8 @@ go build -o better-reviewers
 ## Prerequisites
 
 - Go 1.21 or later
-- GitHub CLI (`gh`) installed and authenticated
+- **For personal use**: GitHub CLI (`gh`) installed and authenticated
+- **For GitHub App mode**: `GITHUB_APP_TOKEN` environment variable with valid app token
 - GitHub token with appropriate permissions (repo access)
 
 ## Usage
@@ -38,10 +43,19 @@ go build -o better-reviewers
 ./better-reviewers -project "owner/repo"
 ```
 
-### Organization Monitoring (Coming Soon)
+### Organization Monitoring
 
 ```bash
 ./better-reviewers -org "myorg"
+```
+
+### GitHub App Mode
+
+Monitor all organizations where your GitHub App is installed:
+
+```bash
+export GITHUB_APP_TOKEN="your_app_token_here"
+./better-reviewers -app
 ```
 
 ### Polling Mode
@@ -56,13 +70,28 @@ go build -o better-reviewers
 ./better-reviewers -pr "owner/repo#123" -dry-run
 ```
 
+### Advanced Configuration
+
+```bash
+# Custom workload limits and caching
+./better-reviewers -org "myorg" -max-prs 5 -pr-count-cache 12h
+
+# Tight time constraints with extended polling
+./better-reviewers -project "owner/repo" -poll 30m -min-age 30m -max-age 7d
+
+# GitHub App monitoring with polling
+export GITHUB_APP_TOKEN="your_app_token_here"
+./better-reviewers -app -poll 2h -dry-run
+```
+
 ## Command Line Options
 
 ### Target Flags (Mutually Exclusive)
 
 - `-pr`: Pull request URL or shorthand (e.g., `https://github.com/owner/repo/pull/123` or `owner/repo#123`)
 - `-project`: GitHub project to monitor (e.g., `owner/repo`)
-- `-org`: GitHub organization to monitor (not yet implemented)
+- `-org`: GitHub organization to monitor
+- `-app`: Monitor all organizations where this GitHub app is installed
 
 ### Behavior Flags
 
@@ -70,6 +99,8 @@ go build -o better-reviewers
 - `-dry-run`: Run in dry-run mode (no actual reviewer assignments)
 - `-min-age`: Minimum time since last commit or review for PR assignment (default: 1h)
 - `-max-age`: Maximum time since last commit or review for PR assignment (default: 180 days)
+- `-max-prs`: Maximum non-stale open PRs a candidate can have before being filtered out (default: 9)
+- `-pr-count-cache`: Cache duration for PR count queries to optimize performance (default: 6h)
 
 ## How It Works
 
@@ -125,13 +156,14 @@ The secondary reviewer is selected based on review activity, in this priority or
 ### GitHub API Usage
 
 The program uses:
-- GitHub REST API v3 for PR data, file changes, and reviews
-- GitHub GraphQL API v4 for blame data and efficient directory/project searches
-- **No longer uses the slow Search API** - replaced with GraphQL queries
-- Caches blame data to avoid redundant API calls
-- 120-second timeout for API calls to handle slow responses
-- Retry logic with exponential backoff for GraphQL requests (up to 3 attempts)
-- Proper authentication using `gh auth token` for all API calls
+- **GitHub REST API v3** for PR data, file changes, and reviews
+- **GitHub GraphQL API v4** for blame data and efficient directory/project searches  
+- **GitHub Search API** for PR count queries with workload balancing
+- **Intelligent caching**: 6-hour cache for PR counts, 20-day cache for PR data, failure caching
+- **Robust retry logic**: 25 attempts with exponential backoff (5s initial, 20min max delay)
+- **Timeout management**: 30-second timeouts for search queries, 120-second for other calls
+- **Graceful degradation**: Continues operation when non-critical APIs fail
+- **Flexible authentication**: `gh auth token` for personal use or `GITHUB_APP_TOKEN` for app installations
 
 ## Architecture
 
@@ -153,25 +185,19 @@ go test -v
 
 ## Example Output
 
-### Successful Primary/Secondary Selection
+### Workload Balancing in Action
 ```
 2024/01/15 10:30:45 Processing PR owner/repo#123: Add new feature
-2024/01/15 10:30:45 Analyzing 3 changed files for PR 123
-2024/01/15 10:30:46 === Finding PRIMARY reviewer (author context) ===
-2024/01/15 10:30:46 Checking blame-based authors for primary reviewer
-2024/01/15 10:30:46 Found author alice from PR 89 with 25 line overlap
-2024/01/15 10:30:46 Found author charlie from PR 76 with 15 line overlap
-2024/01/15 10:30:46 Selected blame-based author: alice (score: 25, association: MEMBER)
-2024/01/15 10:30:47 === Finding SECONDARY reviewer (active reviewer) ===
-2024/01/15 10:30:47 Checking blame-based reviewers for secondary reviewer
-2024/01/15 10:30:47 Found reviewer bob from PR 89 with 25 line overlap
-2024/01/15 10:30:47 Found reviewer dave from PR 76 with 15 line overlap
-2024/01/15 10:30:47 Selected blame-based reviewer: bob (score: 25)
-2024/01/15 10:30:47 PRIMARY reviewer selected: alice (method: primary-blame-author)
-2024/01/15 10:30:47 SECONDARY reviewer selected: bob (method: secondary-blame-reviewer)
-2024/01/15 10:30:47 Found 2 reviewer candidates for PR 123
-2024/01/15 10:30:47 Adding reviewers [alice bob] to PR owner/repo#123
-2024/01/15 10:30:48 Successfully added reviewers [alice bob] to PR 123
+2024/01/15 10:30:45 [CACHE] User type cache hit for alice: User
+2024/01/15 10:30:45     📊 User alice has 3 non-stale open PRs in org myorg (2 assigned, 1 for review)
+2024/01/15 10:30:45 [CACHE] User type cache hit for bob: User  
+2024/01/15 10:30:45     📊 User bob has 12 non-stale open PRs in org myorg (8 assigned, 4 for review)
+2024/01/15 10:30:45     Filtered (too many open PRs 12 > 9 in org myorg): bob
+2024/01/15 10:30:45 [CACHE] User type cache hit for charlie: User
+2024/01/15 10:30:45     📊 User charlie has 5 non-stale open PRs in org myorg (3 assigned, 2 for review)
+2024/01/15 10:30:45 Found 2 reviewer candidates for PR 123
+2024/01/15 10:30:45 Adding reviewers [alice charlie] to PR owner/repo#123
+2024/01/15 10:30:46 Successfully added reviewers [alice charlie] to PR 123
 ```
 
 ### Fallback Mechanism in Action

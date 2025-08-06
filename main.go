@@ -17,6 +17,7 @@ var (
 	prURL   = flag.String("pr", "", "Pull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)")
 	project = flag.String("project", "", "GitHub project to monitor (e.g., owner/repo)")
 	org     = flag.String("org", "", "GitHub organization to monitor")
+	app     = flag.Bool("app", false, "Monitor all organizations where this GitHub app is installed")
 
 	// Behavior flags.
 	poll         = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
@@ -36,7 +37,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	client, err := newGitHubClient(ctx)
+	client, err := newGitHubClient(ctx, *app)
 	if err != nil {
 		log.Fatalf("Failed to create GitHub client: %v", err)
 	}
@@ -53,10 +54,20 @@ func main() {
 
 	if *poll > 0 {
 		log.Printf("Starting polling mode with interval: %v", *poll)
-		finder.startPolling(ctx, *poll)
+		if *app {
+			finder.startAppPolling(ctx, *poll)
+		} else {
+			finder.startPolling(ctx, *poll)
+		}
 	} else {
-		if err := finder.findAndAssignReviewers(ctx); err != nil {
-			log.Fatalf("Failed to find and assign reviewers: %v", err)
+		if *app {
+			if err := finder.findAndAssignReviewersForApp(ctx); err != nil {
+				log.Fatalf("Failed to find and assign reviewers for app installations: %v", err)
+			}
+		} else {
+			if err := finder.findAndAssignReviewers(ctx); err != nil {
+				log.Fatalf("Failed to find and assign reviewers: %v", err)
+			}
 		}
 	}
 }
@@ -73,9 +84,12 @@ func validateFlags() error {
 	if *org != "" {
 		targetFlags++
 	}
+	if *app {
+		targetFlags++
+	}
 
 	if targetFlags != 1 {
-		return errors.New("exactly one of -pr, -project, or -org must be specified")
+		return errors.New("exactly one of -pr, -project, -org, or -app must be specified")
 	}
 
 	return nil
@@ -91,6 +105,8 @@ func setupUsage() {
 		fmt.Fprint(os.Stderr, "    \tGitHub project to monitor (e.g., owner/repo)\n")
 		fmt.Fprint(os.Stderr, "  -org string\n")
 		fmt.Fprint(os.Stderr, "    \tGitHub organization to monitor\n")
+		fmt.Fprint(os.Stderr, "  -app\n")
+		fmt.Fprint(os.Stderr, "    \tMonitor all organizations where this GitHub app is installed\n")
 		fmt.Fprint(os.Stderr, "\nBehavior flags:\n")
 		flag.PrintDefaults()
 	}

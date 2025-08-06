@@ -506,3 +506,107 @@ func (rf *ReviewerFinder) startPolling(ctx context.Context, interval time.Durati
 		}
 	}
 }
+
+// findAndAssignReviewersForApp processes all organizations where the GitHub app is installed.
+func (rf *ReviewerFinder) findAndAssignReviewersForApp(ctx context.Context) error {
+	orgs, err := rf.client.listAppInstallations(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list app installations: %w", err)
+	}
+
+	if len(orgs) == 0 {
+		log.Print("No organization installations found for this GitHub app")
+		return nil
+	}
+
+	var totalProcessed, totalAssigned, totalSkipped int
+
+	for i, orgName := range orgs {
+		if i > 0 {
+			log.Println() // Add blank line between organizations
+		}
+
+		log.Printf("🏢 Processing organization %s (%d/%d)", orgName, i+1, len(orgs))
+
+		// Temporarily set the org global variable for compatibility with existing logic
+		origOrg := *org
+		*org = orgName
+
+		// Get PRs for this organization using existing batch logic
+		prs, err := rf.prsForOrgBatched(ctx, orgName)
+		if err != nil {
+			log.Printf("  ⚠️  Warning: failed to get PRs for org %s: %v (continuing)", orgName, err)
+			*org = origOrg // Restore original value
+			continue
+		}
+
+		// Process PRs for this organization
+		processed, assigned, skipped := rf.processPRsForOrg(ctx, prs, orgName)
+		totalProcessed += processed
+		totalAssigned += assigned
+		totalSkipped += skipped
+
+		// Restore original org value
+		*org = origOrg
+
+		log.Printf("  📊 Organization %s: %d processed, %d assigned, %d skipped", orgName, processed, assigned, skipped)
+	}
+
+	// Print final summary across all organizations
+	if totalProcessed > 0 {
+		log.Printf("\n🎉 App Summary: %d total PRs processed across %d organizations (%d assigned, %d skipped)",
+			totalProcessed, len(orgs), totalAssigned, totalSkipped)
+	}
+
+	return nil
+}
+
+// processPRsForOrg processes PRs for a single organization and returns counts.
+func (rf *ReviewerFinder) processPRsForOrg(ctx context.Context, prs []*PullRequest, orgName string) (processed, assigned, skipped int) {
+	// Use batch processing for multiple PRs
+	if len(prs) > 3 {
+		log.Printf("  🚀 Using batch processing for %d PRs in %s", len(prs), orgName)
+		rf.processPRsBatch(ctx, prs)
+		// For batch processing, we don't have detailed counts, so estimate
+		return len(prs), len(prs) / 2, len(prs) / 2 // Rough estimates
+	}
+
+	// Process individually for small numbers of PRs
+	for _, pr := range prs {
+		processed++
+		wasAssigned, err := rf.processPR(ctx, pr)
+		switch {
+		case err != nil:
+			log.Printf("    ❌ Error processing PR #%d: %v", pr.Number, err)
+		case wasAssigned:
+			assigned++
+		default:
+			skipped++
+		}
+	}
+
+	return processed, assigned, skipped
+}
+
+// startAppPolling runs the app reviewer finder in polling mode.
+func (rf *ReviewerFinder) startAppPolling(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run immediately
+	if err := rf.findAndAssignReviewersForApp(ctx); err != nil {
+		log.Printf("Error in initial app run: %v", err)
+	}
+
+	// Then run periodically
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := rf.findAndAssignReviewersForApp(ctx); err != nil {
+				log.Printf("Error in app polling run: %v", err)
+			}
+		}
+	}
+}
