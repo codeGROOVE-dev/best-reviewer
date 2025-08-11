@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -12,17 +15,31 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // GitHubClient handles all GitHub API interactions.
 type GitHubClient struct {
-	httpClient *http.Client
-	cache      *cache
-	userCache  *userCache
-	token      string
-	isAppAuth  bool // Whether using GitHub App authentication
+	httpClient         *http.Client
+	cache              *cache
+	userCache          *userCache
+	token              string
+	isAppAuth          bool                 // Whether using GitHub App authentication
+	appID              string               // For JWT refresh
+	privateKeyPath     string               // For JWT refresh
+	tokenExpiry        time.Time            // JWT expiry time
+	tokenMutex         sync.RWMutex         // Protect token refresh
+	installationTokens map[string]string    // Map of org -> installation token
+	installationExpiry map[string]time.Time // Map of org -> token expiry
+	installationIDs    map[string]int       // Map of org -> installation ID
+	installationTypes  map[string]string    // Map of org -> "User" or "Organization"
+	currentOrg         string               // Current organization being processed
 }
 
 // PullRequest represents a GitHub pull request.
@@ -69,20 +86,133 @@ type PRInfo struct {
 	Number    int
 }
 
+// generateJWT generates a JWT token for GitHub App authentication.
+func generateJWT(appID string, privateKey []byte) (string, error) {
+	// Parse the private key
+	block, _ := pem.Decode(privateKey)
+	if block == nil {
+		return "", errors.New("failed to parse PEM block containing the private key")
+	}
+
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		// Try PKCS8 format if PKCS1 fails
+		parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return "", fmt.Errorf("failed to parse private key: %w", err)
+		}
+		var ok bool
+		key, ok = parsedKey.(*rsa.PrivateKey)
+		if !ok {
+			return "", errors.New("private key is not RSA")
+		}
+	}
+
+	// Create the JWT claims
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iat": now.Unix(),
+		"exp": now.Add(10 * time.Minute).Unix(), // GitHub Apps JWTs expire after 10 minutes max
+		"iss": appID,
+	}
+
+	// Create and sign the token
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	return token.SignedString(key)
+}
+
 // newGitHubClient creates a new GitHub API client using gh auth token or GitHub App authentication.
-func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error) {
+func newGitHubClient(ctx context.Context, useAppAuth bool, appID, appKeyPath string) (*GitHubClient, error) {
 	var token string
 	var isAppAuth bool
 
 	if useAppAuth {
-		// For GitHub App authentication, check for required environment variables
-		appToken := os.Getenv("GITHUB_APP_TOKEN")
-		if appToken == "" {
-			return nil, errors.New("GITHUB_APP_TOKEN environment variable is required for --app mode")
+		// Use provided flags or fall back to environment variables
+		if appID == "" {
+			appID = os.Getenv("GITHUB_APP_ID")
 		}
-		token = appToken
-		isAppAuth = true
-		log.Print("[AUTH] Using GitHub App authentication")
+		if appKeyPath == "" {
+			appKeyPath = os.Getenv("GITHUB_APP_KEY")
+			if appKeyPath == "" {
+				// Also check the old environment variable for backward compatibility
+				appKeyPath = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
+			}
+		}
+
+		if appID == "" || appKeyPath == "" {
+			return nil, errors.New("GitHub App ID and private key are required. " +
+				"Use --app-id and --app-key flags or set GITHUB_APP_ID and GITHUB_APP_KEY environment variables")
+		}
+
+		// Validate app ID is numeric and within reasonable range
+		appIDNum, err := strconv.Atoi(appID)
+		if err != nil {
+			return nil, fmt.Errorf("GITHUB_APP_ID must be numeric: %w", err)
+		}
+		if appIDNum <= 0 || appIDNum > maxAppID {
+			return nil, errors.New("GITHUB_APP_ID out of valid range")
+		}
+
+		// Validate and clean the private key path to prevent path traversal
+		cleanPath := filepath.Clean(appKeyPath)
+		if !filepath.IsAbs(cleanPath) {
+			return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be an absolute path")
+		}
+
+		// Verify file exists and has appropriate permissions
+		fileInfo, err := os.Stat(cleanPath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot access private key file: %w", err)
+		}
+		if fileInfo.IsDir() {
+			return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be a file, not a directory")
+		}
+		// Check file permissions - must not be world or group readable
+		perm := fileInfo.Mode().Perm()
+		if perm&filePermSecure != 0 {
+			return nil, fmt.Errorf("private key file has insecure permissions %04o (must be 0600 or 0400)", perm)
+		}
+
+		// Read the private key file
+		privateKey, err := os.ReadFile(cleanPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read private key file: %w", err)
+		}
+
+		// Validate it looks like a PEM private key
+		if !bytes.Contains(privateKey, []byte("BEGIN RSA PRIVATE KEY")) &&
+			!bytes.Contains(privateKey, []byte("BEGIN PRIVATE KEY")) {
+			return nil, errors.New("file does not appear to be a valid PEM private key")
+		}
+
+		// Generate JWT
+		jwtToken, err := generateJWT(appID, privateKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate JWT: %w", err)
+		}
+		log.Printf("[AUTH] Successfully generated JWT for GitHub App ID %s", appID)
+
+		// Create client with JWT refresh capability
+		c := &cache{
+			entries: make(map[string]cacheEntry),
+			ttl:     cacheTTL,
+		}
+		go c.cleanupExpired()
+
+		return &GitHubClient{
+			httpClient:         &http.Client{Timeout: time.Duration(httpTimeout) * time.Second},
+			cache:              c,
+			userCache:          &userCache{users: make(map[string]*userInfo)},
+			token:              jwtToken,
+			isAppAuth:          true,
+			appID:              appID,
+			privateKeyPath:     cleanPath,
+			tokenExpiry:        time.Now().Add(9 * time.Minute), // Refresh 1 minute before expiry
+			installationTokens: make(map[string]string),
+			installationExpiry: make(map[string]time.Time),
+			installationIDs:    make(map[string]int),
+			installationTypes:  make(map[string]string),
+		}, nil
 	} else {
 		// Use gh CLI authentication with validation
 		cmd := exec.CommandContext(ctx, "gh", "auth", "token")
@@ -92,20 +222,38 @@ func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error
 		}
 
 		token = strings.TrimSpace(string(output))
-		// Validate token format (should be alphanumeric with underscores)
-		if token == "" || len(token) > maxTokenLength {
-			return nil, errors.New("invalid token length from gh command")
-		}
-		for _, r := range token {
-			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' {
-				return nil, errors.New("invalid token format from gh command")
-			}
-		}
+
+		// Validate token format
 		if token == "" {
 			return nil, errors.New("no GitHub token found")
 		}
+		if len(token) > maxTokenLength || len(token) < minTokenLength {
+			return nil, errors.New("invalid token length")
+		}
+
+		// Validate token format - GitHub tokens have specific prefixes
+		validPrefixes := []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
+		hasValidPrefix := false
+		for _, prefix := range validPrefixes {
+			if strings.HasPrefix(token, prefix) {
+				hasValidPrefix = true
+				break
+			}
+		}
+		if !hasValidPrefix {
+			// Could be a classic token (40 hex chars)
+			if len(token) != classicTokenLength {
+				return nil, errors.New("invalid token format")
+			}
+			for _, r := range token {
+				if (r < 'a' || r > 'f') && (r < '0' || r > '9') {
+					return nil, errors.New("invalid classic token format")
+				}
+			}
+		}
+
 		isAppAuth = false
-		log.Print("[AUTH] Using gh CLI authentication")
+		log.Print("[AUTH] Using personal access token authentication")
 	}
 
 	c := &cache{
@@ -123,12 +271,177 @@ func newGitHubClient(ctx context.Context, useAppAuth bool) (*GitHubClient, error
 	}, nil
 }
 
+// refreshJWTIfNeeded refreshes the JWT token if it's close to expiry.
+func (c *GitHubClient) refreshJWTIfNeeded() error {
+	if !c.isAppAuth {
+		return nil
+	}
+
+	c.tokenMutex.RLock()
+	needsRefresh := time.Now().After(c.tokenExpiry)
+	c.tokenMutex.RUnlock()
+
+	if !needsRefresh {
+		return nil
+	}
+
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+
+	// Double-check after acquiring write lock
+	if time.Now().Before(c.tokenExpiry) {
+		return nil
+	}
+
+	// Read private key
+	privateKey, err := os.ReadFile(c.privateKeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to read private key for refresh: %w", err)
+	}
+
+	// Generate new JWT
+	newToken, err := generateJWT(c.appID, privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to generate JWT for refresh: %w", err)
+	}
+
+	c.token = newToken
+	c.tokenExpiry = time.Now().Add(9 * time.Minute)
+	log.Print("[AUTH] Refreshed GitHub App JWT")
+
+	return nil
+}
+
+// setCurrentOrg sets the current organization being processed.
+func (c *GitHubClient) setCurrentOrg(org string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	c.currentOrg = org
+}
+
+// isUserAccount checks if the given account is a user account (not an organization).
+func (c *GitHubClient) isUserAccount(account string) bool {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.installationTypes[account] == "User"
+}
+
+// getInstallationToken gets or refreshes an installation access token for an organization.
+func (c *GitHubClient) getInstallationToken(ctx context.Context, org string) (string, error) {
+	if !c.isAppAuth {
+		return c.token, nil // Return regular token if not using app auth
+	}
+
+	if org == "" {
+		return "", errors.New("organization name cannot be empty")
+	}
+
+	c.tokenMutex.RLock()
+	// Check if we have a valid cached token
+	if token, ok := c.installationTokens[org]; ok {
+		if expiry, ok := c.installationExpiry[org]; ok && time.Now().Before(expiry) {
+			c.tokenMutex.RUnlock()
+			return token, nil
+		}
+	}
+	c.tokenMutex.RUnlock()
+
+	// Need to create/refresh token - refresh JWT first if needed
+	if err := c.refreshJWTIfNeeded(); err != nil {
+		return "", fmt.Errorf("failed to refresh JWT: %w", err)
+	}
+
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+
+	// Double-check cache after acquiring write lock
+	if token, ok := c.installationTokens[org]; ok {
+		if expiry, ok := c.installationExpiry[org]; ok && time.Now().Before(expiry) {
+			return token, nil
+		}
+	}
+
+	// Get installation ID for this org
+	installationID, ok := c.installationIDs[org]
+	if !ok {
+		log.Printf("[ERROR] No installation ID found for organization %s - app may not be installed", org)
+		return "", fmt.Errorf("no installation ID found for organization %s (is the app installed?)", org)
+	}
+
+	// Create installation access token
+	log.Printf("[AUTH] Creating installation access token for org %s (installation ID: %d)", org, installationID)
+	apiURL := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
+
+	// Use JWT for this request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, http.NoBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf("[ERROR] Failed to request installation token for org %s: %v", org, err)
+		return "", fmt.Errorf("failed to get installation token: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to read error response body for org %s: %v", org, err)
+			return "", fmt.Errorf("failed to create installation token (status %d) and read error: %w", resp.StatusCode, err)
+		}
+		log.Printf("[ERROR] GitHub API error creating installation token for org %s (status %d): %s", org, resp.StatusCode, string(body))
+		return "", fmt.Errorf("failed to create installation token (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		log.Printf("[ERROR] Failed to decode installation token response for org %s: %v", org, err)
+		return "", fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	if tokenResp.Token == "" {
+		log.Printf("[ERROR] Received empty installation token for org %s", org)
+		return "", errors.New("received empty installation token")
+	}
+
+	// Cache the token (expire 5 minutes before actual expiry for safety)
+	c.installationTokens[org] = tokenResp.Token
+	c.installationExpiry[org] = tokenResp.ExpiresAt.Add(-5 * time.Minute)
+
+	log.Printf("[AUTH] Successfully created installation access token for org %s (expires at %s)", org, tokenResp.ExpiresAt.Format(time.RFC3339))
+	return tokenResp.Token, nil
+}
+
 // makeRequest makes an HTTP request to the GitHub API with retry logic.
 func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
-	// Sanitize URL for logging - remove potential sensitive query parameters
+	// Refresh JWT if needed
+	if c.isAppAuth {
+		if err := c.refreshJWTIfNeeded(); err != nil {
+			return nil, fmt.Errorf("failed to refresh JWT: %w", err)
+		}
+	}
+	// Sanitize URL for logging - parse and reconstruct without sensitive parts
 	sanitizedURL := apiURL
-	if idx := strings.Index(apiURL, "?"); idx != -1 {
-		sanitizedURL = apiURL[:idx] + "?[REDACTED]"
+	if parsedURL, err := url.Parse(apiURL); err == nil {
+		// Remove query parameters and userinfo from logging
+		parsedURL.RawQuery = ""
+		parsedURL.User = nil
+		if parsedURL.RawQuery != "" || strings.Contains(apiURL, "?") {
+			sanitizedURL = parsedURL.String() + "?[REDACTED]"
+		} else {
+			sanitizedURL = parsedURL.String()
+		}
 	}
 	log.Printf("[HTTP] %s %s", method, sanitizedURL)
 
@@ -148,11 +461,25 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
+		// Use the appropriate token based on authentication type and current org
+		authToken := c.token
+		if c.isAppAuth && c.currentOrg != "" {
+			// For app auth with a specific org, use installation token
+			installToken, err := c.getInstallationToken(ctx, c.currentOrg)
+			if err == nil {
+				authToken = installToken
+				log.Printf("[DEBUG] Using installation token for org %s", c.currentOrg)
+			} else {
+				// Graceful degradation: try with JWT token
+				log.Printf("[WARN] Failed to get installation token for %s, attempting with JWT (may have limited access): %v", c.currentOrg, err)
+			}
+		}
+
 		if c.isAppAuth {
-			req.Header.Set("Authorization", "Bearer "+c.token)
+			req.Header.Set("Authorization", "Bearer "+authToken)
 			req.Header.Set("Accept", "application/vnd.github.v3+json")
 		} else {
-			req.Header.Set("Authorization", "token "+c.token)
+			req.Header.Set("Authorization", "token "+authToken)
 			req.Header.Set("Accept", "application/vnd.github.v3+json")
 		}
 		if method == "PATCH" || method == "POST" || method == "PUT" {
@@ -166,19 +493,28 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 		}
 
 		// Check for rate limiting or server errors that should trigger retry
-		if localResp.StatusCode == http.StatusTooManyRequests ||
-			(localResp.StatusCode >= http.StatusInternalServerError && localResp.StatusCode < 600) {
-			body, err := io.ReadAll(localResp.Body)
-			if err != nil {
-				if closeErr := localResp.Body.Close(); closeErr != nil {
-					log.Printf("[WARN] Failed to close response body: %v", closeErr)
-				}
-				return fmt.Errorf("failed to read error response: %w", err)
+		if localResp.StatusCode == http.StatusTooManyRequests {
+			// Drain the response body to allow connection reuse
+			if _, err := io.Copy(io.Discard, localResp.Body); err != nil {
+				log.Printf("[WARN] Failed to drain response body: %v", err)
 			}
 			if err := localResp.Body.Close(); err != nil {
 				log.Printf("[WARN] Failed to close response body: %v", err)
 			}
-			return fmt.Errorf("http %d: %s", localResp.StatusCode, string(body))
+			log.Printf("[WARN] Rate limited (429) on %s %s - will retry with backoff", method, sanitizedURL)
+			return fmt.Errorf("http %d: rate limited", localResp.StatusCode)
+		}
+
+		if localResp.StatusCode >= http.StatusInternalServerError && localResp.StatusCode < 600 {
+			// Drain the response body to allow connection reuse
+			if _, err := io.Copy(io.Discard, localResp.Body); err != nil {
+				log.Printf("[WARN] Failed to drain response body: %v", err)
+			}
+			if err := localResp.Body.Close(); err != nil {
+				log.Printf("[WARN] Failed to close response body: %v", err)
+			}
+			log.Printf("[WARN] Server error (%d) on %s %s - will retry with backoff", localResp.StatusCode, method, sanitizedURL)
+			return fmt.Errorf("http %d: server error", localResp.StatusCode)
 		}
 
 		// Success - assign to outer resp variable
@@ -189,12 +525,7 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 		return nil, err
 	}
 
-	// Sanitize URL for logging (reuse variable)
-	if idx := strings.Index(apiURL, "?"); idx != -1 {
-		sanitizedURL = apiURL[:idx] + "?[REDACTED]"
-	} else {
-		sanitizedURL = apiURL
-	}
+	// Log response status with sanitized URL
 	log.Printf("[HTTP] %s %s - Status: %d", method, sanitizedURL, resp.StatusCode)
 	return resp, nil
 }
@@ -605,10 +936,27 @@ func (*ReviewerFinder) isUserBot(_ context.Context, username string) bool {
 }
 
 // hasWriteAccess checks if a user has write access to the repository.
-func (*ReviewerFinder) hasWriteAccess(ctx context.Context, _ string, _ string, _ string) bool {
-	// For simplicity, assume all users have write access
-	// In production, this would check collaborator status
-	return true
+func (rf *ReviewerFinder) hasWriteAccess(ctx context.Context, owner, repo, username string) bool {
+	// Check if user is a collaborator with write access
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators/%s", owner, repo, username)
+	resp, err := rf.client.makeRequest(ctx, httpMethodGet, apiURL, nil)
+	if err != nil {
+		log.Printf("[WARN] Failed to check write access for %s: %v", username, err)
+		return false // Fail closed - assume no access on error
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("[WARN] Failed to close response body: %v", err)
+		}
+	}()
+
+	// GitHub returns 204 No Content if user is a collaborator
+	// Returns 404 if not a collaborator
+	if resp.StatusCode == http.StatusNoContent {
+		return true
+	}
+
+	return false
 }
 
 // openPRCount returns the number of open PRs assigned to or requested for review by a user in an organization.
@@ -750,13 +1098,19 @@ func (c *GitHubClient) listAppInstallations(ctx context.Context) ([]string, erro
 
 	var orgs []string
 	for _, installation := range installations {
-		// Only include organization accounts, not user accounts
+		// Include both organization and user accounts
+		orgs = append(orgs, installation.Account.Login)
+		// Store the installation ID and type for later use
+		c.installationIDs[installation.Account.Login] = installation.ID
+		c.installationTypes[installation.Account.Login] = installation.Account.Type
+
 		if installation.Account.Type == "Organization" {
-			orgs = append(orgs, installation.Account.Login)
 			log.Printf("[APP] Found installation in org: %s (ID: %d)", installation.Account.Login, installation.ID)
+		} else {
+			log.Printf("[APP] Found installation for user: %s (ID: %d)", installation.Account.Login, installation.ID)
 		}
 	}
 
-	log.Printf("[APP] Found %d organization installations", len(orgs))
+	log.Printf("[APP] Found %d installations (organizations and users)", len(orgs))
 	return orgs, nil
 }

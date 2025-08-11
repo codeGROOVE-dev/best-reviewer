@@ -90,23 +90,6 @@ func (rf *ReviewerFinder) fetchRepoUserActivity(ctx context.Context, owner, repo
 					}
 				}
 			}
-			
-			# Recent issues for additional activity
-			issues(first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
-				nodes {
-					author { 
-						login
-						__typename
-					}
-					updatedAt
-					participants(first: 20) {
-						nodes { 
-							login
-							__typename
-						}
-					}
-				}
-			}
 		}
 	}`
 
@@ -157,15 +140,6 @@ func (rf *ReviewerFinder) parseUserActivity(result map[string]any, activities ma
 		if nodes, ok := pullRequests["nodes"].([]any); ok {
 			for _, node := range nodes {
 				rf.parsePRNode(node, activities)
-			}
-		}
-	}
-
-	// Parse issues
-	if issues, ok := repository["issues"].(map[string]any); ok {
-		if nodes, ok := issues["nodes"].([]any); ok {
-			for _, node := range nodes {
-				rf.parseIssueNode(node, activities)
 			}
 		}
 	}
@@ -338,41 +312,6 @@ func (*ReviewerFinder) isBot(userNode map[string]any, login string) bool {
 
 	// Check username patterns
 	return isLikelyBot(login)
-}
-
-// parseIssueNode parses a single issue node for user activity.
-func (rf *ReviewerFinder) parseIssueNode(node any, activities map[string]UserActivity) {
-	issue, ok := node.(map[string]any)
-	if !ok {
-		return
-	}
-
-	var issueDate time.Time
-	if updatedAtStr, ok := issue["updatedAt"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
-			issueDate = t
-		}
-	}
-
-	// Track issue author
-	if author, ok := issue["author"].(map[string]any); ok {
-		if login, ok := author["login"].(string); ok && login != "" {
-			rf.updateUserActivity(activities, login, issueDate, "issue_author")
-		}
-	}
-
-	// Track participants
-	if participants, ok := issue["participants"].(map[string]any); ok {
-		if participantNodes, ok := participants["nodes"].([]any); ok {
-			for _, participantNode := range participantNodes {
-				if participant, ok := participantNode.(map[string]any); ok {
-					if login, ok := participant["login"].(string); ok && login != "" {
-						rf.updateUserActivity(activities, login, issueDate, "participant")
-					}
-				}
-			}
-		}
-	}
 }
 
 // updateUserActivity updates or creates a user activity record.

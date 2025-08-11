@@ -199,7 +199,27 @@ func isValidGitHubName(name string) bool {
 	if name == "" || len(name) > maxGitHubNameLength {
 		return false
 	}
-	// GitHub names can contain alphanumeric characters, hyphens, underscores, and dots
-	validName := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-_.]*$`)
-	return validName.MatchString(name)
+
+	// Prevent directory traversal and command injection
+	if strings.Contains(name, "..") || strings.Contains(name, pathSeparator) ||
+		strings.Contains(name, "\\") || strings.Contains(name, "\n") ||
+		strings.Contains(name, "\r") || strings.Contains(name, "\x00") {
+		return false
+	}
+
+	// GitHub names must start with alphanumeric, can contain hyphens, underscores, dots
+	// Simple validation without lookahead (not supported in Go regexp)
+	validName := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-_.]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+	if !validName.MatchString(name) {
+		return false
+	}
+
+	// Additional security: reject names that look like special files
+	lower := strings.ToLower(name)
+	if lower == "con" || lower == "prn" || lower == "aux" || lower == "nul" ||
+		strings.HasPrefix(lower, "com") || strings.HasPrefix(lower, "lpt") {
+		return false
+	}
+
+	return true
 }

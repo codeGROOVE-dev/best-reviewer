@@ -64,7 +64,7 @@ func TestValidateFlags(t *testing.T) {
 			*project = tt.project
 			*org = tt.org
 
-			err := validateFlags()
+			err := validateFlags("", "")
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateFlags() error = %v, wantErr %v", err, tt.wantErr)
 			}

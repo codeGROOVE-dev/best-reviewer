@@ -15,6 +15,7 @@ import (
 type ReviewerFinder struct {
 	client       *GitHubClient
 	output       *outputFormatter
+	metrics      *MetricsCollector
 	minOpenTime  time.Duration
 	maxOpenTime  time.Duration
 	maxPRs       int
@@ -528,6 +529,9 @@ func (rf *ReviewerFinder) findAndAssignReviewersForApp(ctx context.Context) erro
 
 		log.Printf("🏢 Processing organization %s (%d/%d)", orgName, i+1, len(orgs))
 
+		// Set the current org in the client for proper token usage
+		rf.client.setCurrentOrg(orgName)
+
 		// Temporarily set the org global variable for compatibility with existing logic
 		origOrg := *org
 		*org = orgName
@@ -548,6 +552,8 @@ func (rf *ReviewerFinder) findAndAssignReviewersForApp(ctx context.Context) erro
 
 		// Restore original org value
 		*org = origOrg
+		// Clear the current org in the client
+		rf.client.setCurrentOrg("")
 
 		log.Printf("  📊 Organization %s: %d processed, %d assigned, %d skipped", orgName, processed, assigned, skipped)
 	}

@@ -20,20 +20,18 @@ type cache struct {
 
 // value retrieves a value from cache if not expired.
 func (c *cache) value(key string) (any, bool) {
-	c.mu.RLock()
-	entry, exists := c.entries[key]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	entry, exists := c.entries[key]
 	if !exists {
 		return nil, false
 	}
 
-	// Check expiration without holding the lock
+	// Check expiration while holding the lock to prevent race condition
 	if time.Now().After(entry.expiration) {
 		// Remove expired entry
-		c.mu.Lock()
 		delete(c.entries, key)
-		c.mu.Unlock()
 		return nil, false
 	}
 

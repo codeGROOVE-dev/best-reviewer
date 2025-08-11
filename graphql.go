@@ -15,9 +15,20 @@ import (
 
 // makeGraphQLRequest makes a GraphQL request to GitHub API.
 func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
+	// Validate and sanitize variables to prevent injection
+	if err := validateGraphQLVariables(variables); err != nil {
+		return nil, fmt.Errorf("invalid GraphQL variables: %w", err)
+	}
+
 	// Extract query type for better debugging
 	queryType := extractGraphQLQueryType(query)
 	querySize := len(query)
+
+	// Limit query size to prevent DoS
+	const maxQuerySize = 100000
+	if querySize > maxQuerySize {
+		return nil, fmt.Errorf("GraphQL query too large: %d chars (max %d)", querySize, maxQuerySize)
+	}
 
 	log.Printf("[API] Executing GraphQL query: %s (size: %d chars)", queryType, querySize)
 	if len(variables) > 0 {
@@ -34,19 +45,35 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 		return nil, fmt.Errorf("failed to marshal GraphQL request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GraphQL request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
 	log.Printf("[GRAPHQL] Executing %s query", queryType)
 	start := time.Now()
 
 	var result map[string]any
 	err = retryWithBackoff(ctx, fmt.Sprintf("GraphQL %s query", queryType), func() error {
+		// Create request inside retry to get fresh token
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return fmt.Errorf("failed to create GraphQL request: %w", err)
+		}
+
+		// Use the appropriate token based on authentication type and current org
+		authToken := c.token
+		if c.isAppAuth && c.currentOrg != "" {
+			// For app auth with a specific org, use installation token
+			installToken, err := c.getInstallationToken(ctx, c.currentOrg)
+			if err == nil {
+				authToken = installToken
+				log.Printf("[DEBUG] Using installation token for GraphQL query to org %s", c.currentOrg)
+			} else {
+				// Graceful degradation: try with JWT token
+				log.Printf("[WARN] Failed to get installation token for GraphQL query to org %s, attempting with JWT (may fail): %v",
+					c.currentOrg, err)
+			}
+		}
+
+		req.Header.Set("Authorization", "Bearer "+authToken)
+		req.Header.Set("Content-Type", "application/json")
+
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("graphql request failed: %w", err)
@@ -65,6 +92,7 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 
 		// Check for HTTP errors
 		if resp.StatusCode != http.StatusOK {
+			log.Printf("[ERROR] GraphQL %s query failed with status %d for org %s: %s", queryType, resp.StatusCode, c.currentOrg, string(body))
 			return fmt.Errorf("graphql request failed with status %d: %s", resp.StatusCode, string(body))
 		}
 
@@ -75,6 +103,7 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 
 		// Check for GraphQL errors
 		if errors, ok := result["errors"]; ok {
+			log.Printf("[ERROR] GraphQL %s query returned errors for org %s: %v", queryType, c.currentOrg, errors)
 			return fmt.Errorf("graphql errors: %v", errors)
 		}
 
@@ -87,6 +116,43 @@ func (c *GitHubClient) makeGraphQLRequest(ctx context.Context, query string, var
 	duration := time.Since(start)
 	log.Printf("[GRAPHQL] %s query completed successfully in %v", queryType, duration)
 	return result, nil
+}
+
+// validateGraphQLVariables validates GraphQL variables to prevent injection.
+func validateGraphQLVariables(variables map[string]any) error {
+	for key, value := range variables {
+		// Validate key names
+		if strings.ContainsAny(key, "{}[]\"'\n\r\t") {
+			return fmt.Errorf("invalid character in variable key: %s", key)
+		}
+
+		// Validate string values
+		if str, ok := value.(string); ok {
+			// Check for potential GraphQL injection patterns
+			if strings.Contains(str, "__schema") || strings.Contains(str, "__type") {
+				return errors.New("introspection queries not allowed in variables")
+			}
+			// Limit string length
+			if len(str) > maxGraphQLVarLength {
+				return fmt.Errorf("variable value too long: %d chars", len(str))
+			}
+			// For GitHub names, apply strict validation
+			if key == "owner" || key == "repo" || key == "org" || key == "login" {
+				// Basic validation - no path traversal or special chars
+				if strings.ContainsAny(str, "../\\\n\r\x00") || len(str) > maxGitHubNameLength || str == "" {
+					return fmt.Errorf("invalid GitHub name in variable %s: %s", key, str)
+				}
+			}
+		}
+
+		// Validate numeric values are within reasonable bounds
+		if num, ok := value.(int); ok {
+			if num < 0 || num > maxGraphQLVarNum {
+				return fmt.Errorf("numeric variable out of range: %d", num)
+			}
+		}
+	}
+	return nil
 }
 
 // recentPRsInDirectory finds recent PRs that modified files in a directory.
@@ -611,6 +677,10 @@ func extractGraphQLQueryType(query string) string {
 				// Classify the field line
 				if strings.Contains(fieldLine, "organization(") {
 					return "organization-repositories"
+				}
+
+				if strings.Contains(fieldLine, "user(") {
+					return "user-repositories"
 				}
 
 				if strings.Contains(fieldLine, "repository(") {

@@ -16,37 +16,36 @@ const (
 
 // Configuration constants.
 const (
-	httpTimeout       = 120 // seconds
-	maxRetries        = 3
-	retryDelay        = 2                   // seconds
+	httpTimeout       = 30                  // seconds - reduced for security
 	nearbyLines       = 3                   // lines within this distance count as "nearby"
 	maxFilesToAnalyze = 3                   // Focus on 3 files with largest delta to reduce API calls
 	maxHistoricalPRs  = 2                   // Limit to 2 PRs per file to reduce API calls
-	maxRecentPRs      = 50                  // Increased to get better candidate pool
 	cacheTTL          = 24 * time.Hour      // Default cache TTL for most items
 	prCacheTTL        = 20 * 24 * time.Hour // Cache PRs for 20 days (use updated_at to invalidate)
-	searchCacheTTL    = 15 * time.Minute    // Cache search results for 15 minutes
 
 	// Specific cache TTLs for different data types.
-	userTypeCacheTTL         = 30 * 24 * time.Hour // User type never changes
-	repoContributorsCacheTTL = 4 * time.Hour       // 4 hours - catch people returning from vacation
-	directoryOwnersCacheTTL  = 3 * 24 * time.Hour  // Directory ownership changes slowly
-	recentPRsCacheTTL        = 1 * time.Hour       // Recent PRs for active repos
-	fileHistoryCacheTTL      = 3 * 24 * time.Hour  // File history changes slowly
-	prCountCacheTTL          = 6 * time.Hour       // PR count for workload balancing (default).
-	prCountFailureCacheTTL   = 10 * time.Minute    // Cache failures to avoid repeated API calls.
-	prStaleDaysThreshold     = 90                  // PRs older than this are considered stale.
-	maxTokenLength           = 100                 // Maximum expected length for GitHub tokens.
-	maxURLLength             = 500                 // Maximum URL length to validate.
-	maxPRNumber              = 999999              // Maximum PR number to validate.
-	maxGitHubNameLength      = 100                 // Maximum length for GitHub owner/repo names.
+	repoContributorsCacheTTL = 4 * time.Hour      // 4 hours - catch people returning from vacation
+	directoryOwnersCacheTTL  = 3 * 24 * time.Hour // Directory ownership changes slowly
+	fileHistoryCacheTTL      = 3 * 24 * time.Hour // File history changes slowly
+	prCountCacheTTL          = 6 * time.Hour      // PR count for workload balancing (default).
+	prCountFailureCacheTTL   = 10 * time.Minute   // Cache failures to avoid repeated API calls.
+	prStaleDaysThreshold     = 90                 // PRs older than this are considered stale.
+	maxTokenLength           = 100                // Maximum expected length for GitHub tokens.
+	minTokenLength           = 40                 // Minimum expected length for GitHub tokens.
+	classicTokenLength       = 40                 // Length of classic GitHub tokens.
+	maxAppID                 = 999999999          // Maximum valid GitHub App ID.
+	filePermSecure           = 0o077              // Mask for checking secure file permissions.
+	maxGraphQLVarLength      = 1000               // Maximum length for GraphQL variable strings.
+	maxGraphQLVarNum         = 1000000            // Maximum numeric value for GraphQL variables.
+	maxURLLength             = 500                // Maximum URL length to validate.
+	maxPRNumber              = 999999             // Maximum PR number to validate.
+	maxGitHubNameLength      = 100                // Maximum length for GitHub owner/repo names.
 
 	// API and pagination limits.
 	perPageLimit = 100 // GitHub API per_page limit
 
 	// Analysis parameters.
 	topReviewersLimit = 10 // Number of top reviewers to find
-	progressBarWidth  = 40 // Width of progress bar in characters
 
 	// Overlap scoring parameters.
 	overlapDecayDays  = 30.0 // Days for recency weight decay
@@ -73,10 +72,10 @@ const (
 	criticalFileMultiplier = 1.3 // Main.go, handlers, etc.
 	refactoringMultiplier  = 1.2 // More deletions than additions
 
-	// Retry parameters handled by external library.
-	maxRetryAttempts  = 25               // Maximum retry attempts for API calls.
-	initialRetryDelay = 5 * time.Second  // Initial delay for retry attempts.
-	maxRetryDelay     = 20 * time.Minute // Maximum delay for retry attempts.
+	// Retry parameters for exponential backoff with jitter.
+	maxRetryAttempts  = 25              // Maximum retry attempts for API calls.
+	initialRetryDelay = 1 * time.Second // Initial delay for retry attempts.
+	maxRetryDelay     = 2 * time.Minute // Maximum delay cap (2 minutes as per requirement).
 
 	// PR URL parsing.
 	minURLParts = 4 // Minimum parts in PR URL
@@ -85,7 +84,12 @@ const (
 	graphQLNodes = "nodes" // Common GraphQL field name
 
 	// HTTP constants.
-	httpMethodGet = "GET" // HTTP GET method
+	httpMethodGet     = "GET" // HTTP GET method
+	serverReadTimeout = 10    // seconds - server read timeout
+	serverIdleTimeout = 60    // seconds - server idle timeout
+
+	// Path constants.
+	pathSeparator = "/"
 
 	// Scoring constants.
 	recentActivityScore      = 0.9  // Score for very recent activity (< 3 days)

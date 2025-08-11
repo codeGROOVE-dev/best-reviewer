@@ -178,40 +178,47 @@ func (rf *ReviewerFinder) prsForOrgBatched(ctx context.Context, org string) ([]*
 }
 
 func (rf *ReviewerFinder) prsForOrgWithBatchSize(ctx context.Context, org string, repoLimit, prLimit int) ([]*PullRequest, error) {
-	// Use GraphQL to get essential PR data - parameterized batch sizes
-	query := fmt.Sprintf(`
-	query($org: String!, $cursor: String) {
-		organization(login: $org) {
-			repositories(first: %d, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
-				pageInfo {
-					hasNextPage
-					endCursor
-				}
-				nodes {
-					name
-					owner { login }
-					pullRequests(states: OPEN, first: %d, orderBy: {field: UPDATED_AT, direction: DESC}) {
-						nodes {
-							number
-							title
-							author { login }
-							createdAt
-							updatedAt
-							isDraft
-							assignees(first: 3) {
-								nodes { login }
-							}
-							reviewRequests(first: 5) {
-								nodes {
-									requestedReviewer {
-										... on User { login }
+	// Determine if this is a user or organization account
+	isUser := rf.client.isUserAccount(org)
+
+	// Use different GraphQL query based on account type
+	var query string
+	if isUser {
+		// Use 'user' query for user accounts - only fetch repositories owned by the user
+		query = fmt.Sprintf(`
+		query($org: String!, $cursor: String) {
+			user(login: $org) {
+				repositories(first: %d, after: $cursor, ownerAffiliations: OWNER, orderBy: {field: PUSHED_AT, direction: DESC}) {
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+					nodes {
+						name
+						owner { login }
+						pullRequests(states: OPEN, first: %d, orderBy: {field: UPDATED_AT, direction: DESC}) {
+							nodes {
+								number
+								title
+								author { login }
+								createdAt
+								updatedAt
+								isDraft
+								assignees(first: 3) {
+									nodes { login }
+								}
+								reviewRequests(first: 5) {
+									nodes {
+										requestedReviewer {
+											... on User { login }
+										}
 									}
 								}
-							}
-							commits(last: 1) {
-								nodes {
-									commit {
-										committedDate
+								commits(last: 1) {
+									nodes {
+										commit {
+											committedDate
+										}
 									}
 								}
 							}
@@ -219,8 +226,52 @@ func (rf *ReviewerFinder) prsForOrgWithBatchSize(ctx context.Context, org string
 					}
 				}
 			}
-		}
-	}`, repoLimit, prLimit)
+		}`, repoLimit, prLimit)
+	} else {
+		// Use 'organization' query for organization accounts
+		query = fmt.Sprintf(`
+		query($org: String!, $cursor: String) {
+			organization(login: $org) {
+				repositories(first: %d, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+					nodes {
+						name
+						owner { login }
+						pullRequests(states: OPEN, first: %d, orderBy: {field: UPDATED_AT, direction: DESC}) {
+							nodes {
+								number
+								title
+								author { login }
+								createdAt
+								updatedAt
+								isDraft
+								assignees(first: 3) {
+									nodes { login }
+								}
+								reviewRequests(first: 5) {
+									nodes {
+										requestedReviewer {
+											... on User { login }
+										}
+									}
+								}
+								commits(last: 1) {
+									nodes {
+										commit {
+											committedDate
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}`, repoLimit, prLimit)
+	}
 
 	var allPRs []*PullRequest
 	cursor := ""
@@ -266,24 +317,28 @@ func (rf *ReviewerFinder) parseOrgPRsFromGraphQL(result map[string]any) (prs []*
 	return prs, hasNextPage, cursor
 }
 
-// extractOrgRepositories extracts the repositories object from org GraphQL response.
+// extractOrgRepositories extracts the repositories object from org or user GraphQL response.
 func (*ReviewerFinder) extractOrgRepositories(result map[string]any) map[string]any {
 	data, ok := result["data"].(map[string]any)
 	if !ok {
 		return nil
 	}
 
-	org, ok := data["organization"].(map[string]any)
-	if !ok {
-		return nil
+	// Try organization first
+	if org, ok := data["organization"].(map[string]any); ok {
+		if repos, ok := org["repositories"].(map[string]any); ok {
+			return repos
+		}
 	}
 
-	repos, ok := org["repositories"].(map[string]any)
-	if !ok {
-		return nil
+	// Try user if organization doesn't exist
+	if user, ok := data["user"].(map[string]any); ok {
+		if repos, ok := user["repositories"].(map[string]any); ok {
+			return repos
+		}
 	}
 
-	return repos
+	return nil
 }
 
 // extractPaginationInfo extracts pagination info from repositories response.
@@ -362,18 +417,7 @@ func (rf *ReviewerFinder) parsePRFromGraphQL(prData map[string]any, owner, repo 
 		Repository: repo,
 	}
 
-	rf.parseBasicPRFields(prData, pr)
-	rf.parsePRAuthor(prData, pr)
-	rf.parsePRDates(prData, pr)
-	rf.parsePRAssignees(prData, pr)
-	rf.parsePRReviewers(prData, pr)
-	rf.parsePRLastCommit(prData, pr)
-
-	return pr
-}
-
-// parseBasicPRFields parses basic PR fields like number, title, and draft status.
-func (*ReviewerFinder) parseBasicPRFields(prData map[string]any, pr *PullRequest) {
+	// Parse basic fields directly
 	if number, ok := prData["number"].(float64); ok {
 		pr.Number = int(number)
 	}
@@ -383,22 +427,15 @@ func (*ReviewerFinder) parseBasicPRFields(prData map[string]any, pr *PullRequest
 	if isDraft, ok := prData["isDraft"].(bool); ok {
 		pr.Draft = isDraft
 	}
-}
 
-// parsePRAuthor parses the PR author information.
-func (*ReviewerFinder) parsePRAuthor(prData map[string]any, pr *PullRequest) {
-	author, ok := prData["author"].(map[string]any)
-	if !ok {
-		return
+	// Parse author
+	if author, ok := prData["author"].(map[string]any); ok {
+		if login, ok := author["login"].(string); ok {
+			pr.Author = login
+		}
 	}
 
-	if login, ok := author["login"].(string); ok {
-		pr.Author = login
-	}
-}
-
-// parsePRDates parses PR creation and update dates.
-func (*ReviewerFinder) parsePRDates(prData map[string]any, pr *PullRequest) {
+	// Parse dates
 	if createdAt, ok := prData["createdAt"].(string); ok {
 		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 			pr.CreatedAt = t
@@ -409,6 +446,12 @@ func (*ReviewerFinder) parsePRDates(prData map[string]any, pr *PullRequest) {
 			pr.UpdatedAt = t
 		}
 	}
+
+	rf.parsePRAssignees(prData, pr)
+	rf.parsePRReviewers(prData, pr)
+	rf.parsePRLastCommit(prData, pr)
+
+	return pr
 }
 
 // parsePRAssignees parses the list of PR assignees.
