@@ -29,7 +29,7 @@ var (
 	loopDelay    = flag.Duration("loop-delay", 5*time.Minute, "Loop delay in serve mode (default: 5m)")
 	dryRun       = flag.Bool("dry-run", false, "Run in dry-run mode (no actual approvals)")
 	minOpenTime  = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
-	maxOpenTime  = flag.Duration("max-age", 180*24*time.Hour, "Maximum time since last activity for PR assignment")
+	maxOpenTime  = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
 	maxPRs       = flag.Int("max-prs", 9, "Maximum number of non-stale open PRs a candidate can have before being filtered out")
 	prCountCache = flag.Duration("pr-count-cache", prCountCacheTTL, "Cache duration for PR count queries (e.g., 6h, 12h)")
 )
