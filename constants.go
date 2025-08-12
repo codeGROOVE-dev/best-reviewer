@@ -35,6 +35,8 @@ const (
 	classicTokenLength       = 40                 // Length of classic GitHub tokens.
 	maxAppID                 = 999999999          // Maximum valid GitHub App ID.
 	filePermSecure           = 0o077              // Mask for checking secure file permissions.
+	filePermReadOnly         = 0o400              // Read-only file permissions.
+	filePermOwnerRW          = 0o600              // Owner read-write file permissions.
 	maxGraphQLVarLength      = 1000               // Maximum length for GraphQL variable strings.
 	maxGraphQLVarNum         = 1000000            // Maximum numeric value for GraphQL variables.
 	maxURLLength             = 500                // Maximum URL length to validate.
@@ -128,4 +130,7 @@ const (
 	monthlyDaysThreshold   = 30 // Days threshold for monthly activity
 	bimonthlyDaysThreshold = 60 // Days threshold for bimonthly activity
 	quarterlyDaysThreshold = 90 // Days threshold for quarterly activity
+
+	// Log safety constants.
+	maxLogKeyLength = 100 // Maximum length for app key in logs
 )

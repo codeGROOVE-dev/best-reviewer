@@ -26,20 +26,21 @@ import (
 
 // GitHubClient handles all GitHub API interactions.
 type GitHubClient struct {
-	httpClient         *http.Client
+	tokenExpiry        time.Time
+	installationTokens map[string]string
 	cache              *cache
+	httpClient         *http.Client
+	installationExpiry map[string]time.Time
+	installationIDs    map[string]int
+	installationTypes  map[string]string
 	userCache          *userCache
+	appID              string
 	token              string
-	isAppAuth          bool                 // Whether using GitHub App authentication
-	appID              string               // For JWT refresh
-	privateKeyPath     string               // For JWT refresh
-	tokenExpiry        time.Time            // JWT expiry time
-	tokenMutex         sync.RWMutex         // Protect token refresh
-	installationTokens map[string]string    // Map of org -> installation token
-	installationExpiry map[string]time.Time // Map of org -> token expiry
-	installationIDs    map[string]int       // Map of org -> installation ID
-	installationTypes  map[string]string    // Map of org -> "User" or "Organization"
-	currentOrg         string               // Current organization being processed
+	privateKeyPath     string
+	currentOrg         string
+	privateKeyContent  []byte
+	tokenMutex         sync.RWMutex
+	isAppAuth          bool
 }
 
 // PullRequest represents a GitHub pull request.
@@ -123,138 +124,55 @@ func generateJWT(appID string, privateKey []byte) (string, error) {
 
 // newGitHubClient creates a new GitHub API client using gh auth token or GitHub App authentication.
 func newGitHubClient(ctx context.Context, useAppAuth bool, appID, appKeyPath string) (*GitHubClient, error) {
-	var token string
-	var isAppAuth bool
-
 	if useAppAuth {
-		// Use provided flags or fall back to environment variables
-		if appID == "" {
-			appID = os.Getenv("GITHUB_APP_ID")
-		}
-		if appKeyPath == "" {
-			appKeyPath = os.Getenv("GITHUB_APP_KEY")
-			if appKeyPath == "" {
-				// Also check the old environment variable for backward compatibility
-				appKeyPath = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
-			}
-		}
-
-		if appID == "" || appKeyPath == "" {
-			return nil, errors.New("GitHub App ID and private key are required. " +
-				"Use --app-id and --app-key flags or set GITHUB_APP_ID and GITHUB_APP_KEY environment variables")
-		}
-
-		// Validate app ID is numeric and within reasonable range
-		appIDNum, err := strconv.Atoi(appID)
-		if err != nil {
-			return nil, fmt.Errorf("GITHUB_APP_ID must be numeric: %w", err)
-		}
-		if appIDNum <= 0 || appIDNum > maxAppID {
-			return nil, errors.New("GITHUB_APP_ID out of valid range")
-		}
-
-		// Validate and clean the private key path to prevent path traversal
-		cleanPath := filepath.Clean(appKeyPath)
-		if !filepath.IsAbs(cleanPath) {
-			return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be an absolute path")
-		}
-
-		// Verify file exists and has appropriate permissions
-		fileInfo, err := os.Stat(cleanPath)
-		if err != nil {
-			return nil, fmt.Errorf("cannot access private key file: %w", err)
-		}
-		if fileInfo.IsDir() {
-			return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be a file, not a directory")
-		}
-		// Check file permissions - must not be world or group readable
-		perm := fileInfo.Mode().Perm()
-		if perm&filePermSecure != 0 {
-			return nil, fmt.Errorf("private key file has insecure permissions %04o (must be 0600 or 0400)", perm)
-		}
-
-		// Read the private key file
-		privateKey, err := os.ReadFile(cleanPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read private key file: %w", err)
-		}
-
-		// Validate it looks like a PEM private key
-		if !bytes.Contains(privateKey, []byte("BEGIN RSA PRIVATE KEY")) &&
-			!bytes.Contains(privateKey, []byte("BEGIN PRIVATE KEY")) {
-			return nil, errors.New("file does not appear to be a valid PEM private key")
-		}
-
-		// Generate JWT
-		jwtToken, err := generateJWT(appID, privateKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate JWT: %w", err)
-		}
-		log.Printf("[AUTH] Successfully generated JWT for GitHub App ID %s", appID)
-
-		// Create client with JWT refresh capability
-		c := &cache{
-			entries: make(map[string]cacheEntry),
-			ttl:     cacheTTL,
-		}
-		go c.cleanupExpired()
-
-		return &GitHubClient{
-			httpClient:         &http.Client{Timeout: time.Duration(httpTimeout) * time.Second},
-			cache:              c,
-			userCache:          &userCache{users: make(map[string]*userInfo)},
-			token:              jwtToken,
-			isAppAuth:          true,
-			appID:              appID,
-			privateKeyPath:     cleanPath,
-			tokenExpiry:        time.Now().Add(9 * time.Minute), // Refresh 1 minute before expiry
-			installationTokens: make(map[string]string),
-			installationExpiry: make(map[string]time.Time),
-			installationIDs:    make(map[string]int),
-			installationTypes:  make(map[string]string),
-		}, nil
-	} else {
-		// Use gh CLI authentication with validation
-		cmd := exec.CommandContext(ctx, "gh", "auth", "token")
-		output, err := cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get GitHub token: %w", err)
-		}
-
-		token = strings.TrimSpace(string(output))
-
-		// Validate token format
-		if token == "" {
-			return nil, errors.New("no GitHub token found")
-		}
-		if len(token) > maxTokenLength || len(token) < minTokenLength {
-			return nil, errors.New("invalid token length")
-		}
-
-		// Validate token format - GitHub tokens have specific prefixes
-		validPrefixes := []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
-		hasValidPrefix := false
-		for _, prefix := range validPrefixes {
-			if strings.HasPrefix(token, prefix) {
-				hasValidPrefix = true
-				break
-			}
-		}
-		if !hasValidPrefix {
-			// Could be a classic token (40 hex chars)
-			if len(token) != classicTokenLength {
-				return nil, errors.New("invalid token format")
-			}
-			for _, r := range token {
-				if (r < 'a' || r > 'f') && (r < '0' || r > '9') {
-					return nil, errors.New("invalid classic token format")
-				}
-			}
-		}
-
-		isAppAuth = false
-		log.Print("[AUTH] Using personal access token authentication")
+		return newAppAuthClient(ctx, appID, appKeyPath)
 	}
+	return newPersonalTokenClient(ctx)
+}
+
+func newAppAuthClient(_ context.Context, appID, appKeyPath string) (*GitHubClient, error) {
+	// Resolve credentials from flags or environment variables
+	creds, err := resolveAppCredentials(appID, appKeyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate app ID
+	if err := validateAppID(creds.appID); err != nil {
+		return nil, err
+	}
+
+	// Load private key
+	privateKey, err := loadPrivateKey(creds.privateKeyContent, creds.keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate JWT
+	jwtToken, err := generateJWT(creds.appID, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate JWT: %w", err)
+	}
+	log.Print("[AUTH] Successfully generated JWT for GitHub App")
+
+	// Create and configure client
+	return createAppAuthClient(creds.appID, creds.keyPath, creds.privateKeyContent, jwtToken), nil
+}
+
+func newPersonalTokenClient(ctx context.Context) (*GitHubClient, error) {
+	// Get token from gh CLI
+	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get GitHub token: %w", err)
+	}
+
+	token := strings.TrimSpace(string(output))
+	if err := validateToken(token); err != nil {
+		return nil, err
+	}
+
+	log.Print("[AUTH] Using personal access token authentication")
 
 	c := &cache{
 		entries: make(map[string]cacheEntry),
@@ -267,8 +185,193 @@ func newGitHubClient(ctx context.Context, useAppAuth bool, appID, appKeyPath str
 		cache:      c,
 		userCache:  &userCache{users: make(map[string]*userInfo)},
 		token:      token,
-		isAppAuth:  isAppAuth,
+		isAppAuth:  false,
 	}, nil
+}
+
+type appCredentials struct {
+	appID             string
+	keyPath           string
+	privateKeyContent []byte
+}
+
+func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
+	// Use provided flags or fall back to environment variables
+	if appID == "" {
+		appID = os.Getenv("GITHUB_APP_ID")
+	}
+
+	var privateKeyContent []byte
+	if appKeyPath != "" {
+		log.Printf("[AUTH] Using private key file path from command line: %s", appKeyPath)
+	} else {
+		// Check for private key content first (more secure)
+		if keyContent := os.Getenv("GITHUB_APP_KEY"); keyContent != "" {
+			privateKeyContent = []byte(keyContent)
+			log.Printf("[AUTH] Using GITHUB_APP_KEY environment variable (%d bytes)", len(privateKeyContent))
+			// Clear appKeyPath to ensure we don't try to read from file
+			appKeyPath = ""
+		} else {
+			// Fall back to key file path only if no content is provided
+			appKeyPath = os.Getenv("GITHUB_APP_KEY_PATH")
+			if appKeyPath == "" {
+				// Also check the old environment variable for backward compatibility
+				appKeyPath = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
+			}
+			if appKeyPath != "" {
+				log.Printf("[AUTH] Using private key file path: %s", appKeyPath)
+			}
+		}
+	}
+
+	if appID == "" {
+		return nil, errors.New("GitHub App ID is required. " +
+			"Use --app-id flag or set GITHUB_APP_ID environment variable")
+	}
+	if len(privateKeyContent) == 0 && appKeyPath == "" {
+		return nil, errors.New("GitHub App private key is required. " +
+			"Use --app-key-path flag, set GITHUB_APP_KEY environment variable (key content), " +
+			"or set GITHUB_APP_KEY_PATH environment variable (file path)")
+	}
+
+	return &appCredentials{
+		appID:             appID,
+		privateKeyContent: privateKeyContent,
+		keyPath:           appKeyPath,
+	}, nil
+}
+
+func validateAppID(appID string) error {
+	appIDNum, err := strconv.Atoi(appID)
+	if err != nil {
+		return fmt.Errorf("GITHUB_APP_ID must be numeric: %w", err)
+	}
+	if appIDNum <= 0 || appIDNum > maxAppID {
+		return errors.New("GITHUB_APP_ID out of valid range")
+	}
+	return nil
+}
+
+func loadPrivateKey(privateKeyContent []byte, keyPath string) ([]byte, error) {
+	var privateKey []byte
+	var err error
+
+	switch {
+	case len(privateKeyContent) > 0:
+		// Use direct key content
+		privateKey = privateKeyContent
+	case keyPath != "":
+		// Read from file path only if path is provided
+		privateKey, err = readPrivateKeyFile(keyPath)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.New("no private key provided (neither content nor path)")
+	}
+
+	// Validate it looks like a PEM private key
+	if !bytes.Contains(privateKey, []byte("BEGIN RSA PRIVATE KEY")) &&
+		!bytes.Contains(privateKey, []byte("BEGIN PRIVATE KEY")) {
+		return nil, errors.New("private key does not appear to be a valid PEM private key")
+	}
+
+	return privateKey, nil
+}
+
+func readPrivateKeyFile(keyPath string) ([]byte, error) {
+	// Validate and clean the private key path to prevent path traversal
+	cleanPath := filepath.Clean(keyPath)
+	if !filepath.IsAbs(cleanPath) {
+		return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be an absolute path")
+	}
+
+	// Verify file exists and has appropriate permissions
+	fileInfo, err := os.Stat(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access private key file: %w", err)
+	}
+	if fileInfo.IsDir() {
+		return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be a file, not a directory")
+	}
+
+	// Check file permissions - must be exactly 0600 or 0400
+	perm := fileInfo.Mode().Perm()
+	if perm != filePermOwnerRW && perm != filePermReadOnly {
+		return nil, fmt.Errorf("private key file has insecure permissions %04o (must be 0600 or 0400)", perm)
+	}
+
+	// Read the private key file
+	return os.ReadFile(cleanPath)
+}
+
+func validateToken(token string) error {
+	if token == "" {
+		return errors.New("no GitHub token found")
+	}
+	if len(token) > maxTokenLength || len(token) < minTokenLength {
+		return errors.New("invalid token length")
+	}
+
+	// Validate token format - GitHub tokens have specific prefixes
+	validPrefixes := []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
+	for _, prefix := range validPrefixes {
+		if strings.HasPrefix(token, prefix) {
+			return nil
+		}
+	}
+
+	// Could be a classic token (40 hex chars)
+	if len(token) != classicTokenLength {
+		return errors.New("invalid token format")
+	}
+	for _, r := range token {
+		if (r < 'a' || r > 'f') && (r < '0' || r > '9') {
+			return errors.New("invalid classic token format")
+		}
+	}
+
+	return nil
+}
+
+func createAppAuthClient(appID, keyPath string, privateKeyContent []byte, jwtToken string) *GitHubClient {
+	c := &cache{
+		entries: make(map[string]cacheEntry),
+		ttl:     cacheTTL,
+	}
+	go c.cleanupExpired()
+
+	client := &GitHubClient{
+		httpClient:         &http.Client{Timeout: time.Duration(httpTimeout) * time.Second},
+		cache:              c,
+		userCache:          &userCache{users: make(map[string]*userInfo)},
+		token:              jwtToken,
+		isAppAuth:          true,
+		appID:              appID,
+		privateKeyPath:     keyPath,
+		tokenExpiry:        time.Now().Add(9 * time.Minute), // Refresh 1 minute before expiry
+		installationTokens: make(map[string]string),
+		installationExpiry: make(map[string]time.Time),
+		installationIDs:    make(map[string]int),
+		installationTypes:  make(map[string]string),
+	}
+
+	// Store private key content if using direct content approach
+	if len(privateKeyContent) > 0 {
+		client.privateKeyContent = privateKeyContent
+	}
+
+	return client
+}
+
+// drainAndCloseBody drains and closes an HTTP response body to prevent resource leaks.
+func drainAndCloseBody(body io.ReadCloser) {
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		log.Printf("[WARN] Failed to drain response body: %v", err)
+	}
+	if err := body.Close(); err != nil {
+		log.Printf("[WARN] Failed to close response body: %v", err)
+	}
 }
 
 // refreshJWTIfNeeded refreshes the JWT token if it's close to expiry.
@@ -293,10 +396,21 @@ func (c *GitHubClient) refreshJWTIfNeeded() error {
 		return nil
 	}
 
-	// Read private key
-	privateKey, err := os.ReadFile(c.privateKeyPath)
-	if err != nil {
-		return fmt.Errorf("failed to read private key for refresh: %w", err)
+	// Get private key - either from stored content or file
+	var privateKey []byte
+	var err error
+	switch {
+	case len(c.privateKeyContent) > 0:
+		// Use stored private key content
+		privateKey = c.privateKeyContent
+	case c.privateKeyPath != "":
+		// Read from file
+		privateKey, err = os.ReadFile(c.privateKeyPath)
+		if err != nil {
+			return fmt.Errorf("failed to read private key for refresh: %w", err)
+		}
+	default:
+		return errors.New("no private key available for JWT refresh")
 	}
 
 	// Generate new JWT
@@ -402,8 +516,8 @@ func (c *GitHubClient) getInstallationToken(ctx context.Context, org string) (st
 	}
 
 	var tokenResp struct {
-		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
+		Token     string    `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		log.Printf("[ERROR] Failed to decode installation token response for org %s: %v", org, err)
@@ -431,17 +545,10 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 			return nil, fmt.Errorf("failed to refresh JWT: %w", err)
 		}
 	}
-	// Sanitize URL for logging - parse and reconstruct without sensitive parts
+	// Sanitize URL for logging - remove all sensitive query parameters
 	sanitizedURL := apiURL
-	if parsedURL, err := url.Parse(apiURL); err == nil {
-		// Remove query parameters and userinfo from logging
-		parsedURL.RawQuery = ""
-		parsedURL.User = nil
-		if parsedURL.RawQuery != "" || strings.Contains(apiURL, "?") {
-			sanitizedURL = parsedURL.String() + "?[REDACTED]"
-		} else {
-			sanitizedURL = parsedURL.String()
-		}
+	if idx := strings.Index(apiURL, "?"); idx != -1 {
+		sanitizedURL = apiURL[:idx] + "?[REDACTED]"
 	}
 	log.Printf("[HTTP] %s %s", method, sanitizedURL)
 
@@ -487,37 +594,25 @@ func (c *GitHubClient) makeRequest(ctx context.Context, method, apiURL string, b
 		}
 
 		var localResp *http.Response
-		localResp, err = c.httpClient.Do(req)
+		localResp, err = c.httpClient.Do(req) //nolint:bodyclose // body is closed via defer or passed to caller
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
 
 		// Check for rate limiting or server errors that should trigger retry
 		if localResp.StatusCode == http.StatusTooManyRequests {
-			// Drain the response body to allow connection reuse
-			if _, err := io.Copy(io.Discard, localResp.Body); err != nil {
-				log.Printf("[WARN] Failed to drain response body: %v", err)
-			}
-			if err := localResp.Body.Close(); err != nil {
-				log.Printf("[WARN] Failed to close response body: %v", err)
-			}
+			drainAndCloseBody(localResp.Body)
 			log.Printf("[WARN] Rate limited (429) on %s %s - will retry with backoff", method, sanitizedURL)
 			return fmt.Errorf("http %d: rate limited", localResp.StatusCode)
 		}
 
 		if localResp.StatusCode >= http.StatusInternalServerError && localResp.StatusCode < 600 {
-			// Drain the response body to allow connection reuse
-			if _, err := io.Copy(io.Discard, localResp.Body); err != nil {
-				log.Printf("[WARN] Failed to drain response body: %v", err)
-			}
-			if err := localResp.Body.Close(); err != nil {
-				log.Printf("[WARN] Failed to close response body: %v", err)
-			}
+			drainAndCloseBody(localResp.Body)
 			log.Printf("[WARN] Server error (%d) on %s %s - will retry with backoff", localResp.StatusCode, method, sanitizedURL)
 			return fmt.Errorf("http %d: server error", localResp.StatusCode)
 		}
 
-		// Success - assign to outer resp variable
+		// Success - assign to outer resp variable and let caller handle body
 		resp = localResp
 		return nil
 	})
@@ -1059,14 +1154,12 @@ func (c *GitHubClient) searchPRCount(ctx context.Context, query string) (int, er
 }
 
 // Installation represents a GitHub App installation.
-//
-//nolint:govet // Field alignment optimization not worth the readability cost
 type Installation struct {
-	ID      int `json:"id"`
 	Account struct {
 		Login string `json:"login"`
 		Type  string `json:"type"`
 	} `json:"account"`
+	ID int `json:"id"`
 }
 
 // listAppInstallations returns all organizations where this GitHub app is installed.

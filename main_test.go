@@ -163,9 +163,9 @@ func TestParsePatchForChangedLines(t *testing.T) {
 	rf := &ReviewerFinder{}
 
 	tests := []struct {
+		wantLines map[int]bool
 		name      string
 		patch     string
-		wantLines map[int]bool
 	}{
 		{
 			name: "simple patch",
@@ -214,9 +214,9 @@ func TestIsPRReady(t *testing.T) {
 	now := time.Now()
 
 	tests := []struct {
-		name       string
 		lastCommit time.Time
 		lastReview time.Time
+		name       string
 		minAge     time.Duration
 		maxAge     time.Duration
 		wantReady  bool
@@ -333,8 +333,8 @@ func TestAssigneePrioritization(t *testing.T) {
 	tests := []struct {
 		name       string
 		prAuthor   string
-		assignees  []string
 		wantExpert string
+		assignees  []string
 	}{
 		{
 			name:       "assignee who isn't author is selected",

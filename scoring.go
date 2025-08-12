@@ -16,12 +16,10 @@ type SimplifiedScorer struct {
 }
 
 // ReviewerScore represents a scored reviewer candidate.
-//
-//nolint:govet // Field alignment optimization not worth the readability cost
 type ReviewerScore struct {
+	Factors  map[string]float64
 	Username string
 	Score    float64
-	Factors  map[string]float64 // For debugging/transparency
 }
 
 // scoreContributors scores a list of contributors for their suitability as reviewers.
@@ -249,12 +247,10 @@ func (s *SimplifiedScorer) hasContributorTouchedFile(_ context.Context, owner, r
 }
 
 // Contributor represents a repository contributor.
-//
-//nolint:govet // Field alignment optimization not worth the readability cost
 type Contributor struct {
+	LastActivity time.Time
 	Login        string
 	Commits      int
-	LastActivity time.Time
 }
 
 // topContributors fetches the top contributors for a repository.

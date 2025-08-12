@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -17,11 +18,10 @@ var (
 	prURL   = flag.String("pr", "", "Pull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)")
 	project = flag.String("project", "", "GitHub project to monitor (e.g., owner/repo)")
 	org     = flag.String("org", "", "GitHub organization to monitor")
-	app     = flag.Bool("app", false, "Monitor all organizations where this GitHub app is installed (deprecated, use --app-id and --app-key)")
 
 	// GitHub App authentication flags.
-	appID  = flag.String("app-id", "", "GitHub App ID for authentication")
-	appKey = flag.String("app-key", "", "Path to GitHub App private key file")
+	appID      = flag.String("app-id", "", "GitHub App ID for authentication")
+	appKeyPath = flag.String("app-key-path", "", "Path to GitHub App private key file")
 
 	// Behavior flags.
 	poll         = flag.Duration("poll", 0, "Polling interval (e.g., 1h, 30m). If not set, runs once")
@@ -38,14 +38,26 @@ func main() {
 	setupUsage()
 	flag.Parse()
 
+	// Log command-line arguments (safely)
+	log.Printf("[STARTUP] Command-line arguments: %v", os.Args)
+	// Log app-key-path safely (only show if it looks like a path, not content)
+	appKeyLog := *appKeyPath
+	if len(appKeyLog) > maxLogKeyLength || strings.Contains(appKeyLog, "BEGIN") {
+		appKeyLog = fmt.Sprintf("<%d bytes, likely PEM content>", len(appKeyLog))
+	}
+	log.Printf("[STARTUP] Parsed flags: app-id=%s, app-key-path=%s, serve=%v, pr=%s, project=%s, org=%s",
+		*appID, appKeyLog, *serve, *prURL, *project, *org)
+
 	// Check environment variables if flags are empty
 	effectiveAppID := *appID
-	effectiveAppKey := *appKey
+	effectiveAppKey := *appKeyPath
 	if effectiveAppID == "" {
 		effectiveAppID = os.Getenv("GITHUB_APP_ID")
 	}
 	if effectiveAppKey == "" {
-		effectiveAppKey = os.Getenv("GITHUB_APP_KEY")
+		// Only check for file path environment variables, not GITHUB_APP_KEY
+		// GITHUB_APP_KEY contains content and is handled in resolveAppCredentials
+		effectiveAppKey = os.Getenv("GITHUB_APP_KEY_PATH")
 		if effectiveAppKey == "" {
 			effectiveAppKey = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
 		}
@@ -56,8 +68,9 @@ func main() {
 	}
 
 	ctx := context.Background()
-	// Use app authentication if either new flags or old flag is set
-	useAppAuth := *app || (effectiveAppID != "" && effectiveAppKey != "")
+	// Use app authentication if app ID and key are provided
+	hasKey := effectiveAppKey != "" || os.Getenv("GITHUB_APP_KEY") != ""
+	useAppAuth := effectiveAppID != "" && hasKey
 	client, err := newGitHubClient(ctx, useAppAuth, effectiveAppID, effectiveAppKey)
 	if err != nil {
 		log.Fatalf("Failed to create GitHub client: %v", err)
@@ -77,7 +90,7 @@ func main() {
 	switch {
 	case *serve:
 		if !useAppAuth {
-			log.Fatal("Serve mode requires GitHub App authentication (--app-id and --app-key)")
+			log.Fatal("Serve mode requires GitHub App authentication (--app-id and --app-key-path)")
 		}
 		log.Printf("Starting serve mode with loop delay: %v", *loopDelay)
 		finder.runServeMode(ctx, *loopDelay)
@@ -105,8 +118,10 @@ func main() {
 func validateFlags(effectiveAppID, effectiveAppKey string) error {
 	// Serve mode requires app auth
 	if *serve {
-		if effectiveAppID == "" || effectiveAppKey == "" {
-			return errors.New("--serve mode requires --app-id and --app-key")
+		// Check if we have app ID and either a key path or GITHUB_APP_KEY env var
+		hasKey := effectiveAppKey != "" || os.Getenv("GITHUB_APP_KEY") != ""
+		if effectiveAppID == "" || !hasKey {
+			return errors.New("--serve mode requires --app-id and --app-key-path (or GITHUB_APP_KEY environment variable)")
 		}
 		return nil
 	}
@@ -121,12 +136,13 @@ func validateFlags(effectiveAppID, effectiveAppKey string) error {
 	if *org != "" {
 		targetFlags++
 	}
-	if *app || (effectiveAppID != "" && effectiveAppKey != "") {
+	hasKey := effectiveAppKey != "" || os.Getenv("GITHUB_APP_KEY") != ""
+	if effectiveAppID != "" && hasKey {
 		targetFlags++
 	}
 
 	if targetFlags != 1 {
-		return errors.New("exactly one of -pr, -project, -org, --app-id/--app-key, or --serve must be specified")
+		return errors.New("exactly one of -pr, -project, -org, --app-id/--app-key-path, or --serve must be specified")
 	}
 
 	return nil
@@ -142,8 +158,8 @@ func setupUsage() {
 		fmt.Fprint(os.Stderr, "    \tGitHub project to monitor (e.g., owner/repo)\n")
 		fmt.Fprint(os.Stderr, "  -org string\n")
 		fmt.Fprint(os.Stderr, "    \tGitHub organization to monitor\n")
-		fmt.Fprint(os.Stderr, "  -app\n")
-		fmt.Fprint(os.Stderr, "    \tMonitor all organizations where this GitHub app is installed\n")
+		fmt.Fprint(os.Stderr, "  --app-id string\n")
+		fmt.Fprint(os.Stderr, "    \tGitHub App ID (use with --app-key-path to monitor all app installations)\n")
 		fmt.Fprint(os.Stderr, "\nBehavior flags:\n")
 		flag.PrintDefaults()
 	}

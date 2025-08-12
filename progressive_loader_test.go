@@ -12,7 +12,7 @@ import (
 )
 
 func TestProgressiveLoaderCodeOwnersPriority(t *testing.T) {
-	server := createTestServer()
+	server := httptest.NewServer(http.HandlerFunc(handleTestRequest))
 	defer server.Close()
 
 	// Create a GitHub client that will use our test server
@@ -132,13 +132,8 @@ func TestProgressiveLoaderCodeOwnersPriority(t *testing.T) {
 	})
 }
 
-func createTestServer() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(handleTestRequest))
-}
-
 func handleTestRequest(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	log.Printf("[TEST] Received request for path: %s", path)
 
 	switch path {
 	case "/repos/testowner/testrepo/contents/.github/CODEOWNERS":
@@ -147,12 +142,12 @@ func handleTestRequest(w http.ResponseWriter, r *http.Request) {
 		"/repos/testowner/testrepo/contents/docs/CODEOWNERS":
 		w.WriteHeader(http.StatusNotFound)
 	default:
-		if strings.HasPrefix(path, "/users/") {
+		switch {
+		case strings.HasPrefix(path, "/users/"):
 			handleUserRequest(w, path)
-		} else if strings.HasPrefix(path, "/repos/testowner/testrepo/collaborators/") {
+		case strings.HasPrefix(path, "/repos/testowner/testrepo/collaborators/"):
 			handleCollaboratorRequest(w, path)
-		} else {
-			log.Printf("[TEST] No handler for path: %s", path)
+		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}
@@ -160,7 +155,7 @@ func handleTestRequest(w http.ResponseWriter, r *http.Request) {
 
 func handleCodeOwnersRequest(w http.ResponseWriter) {
 	content := getCodeOwnersContent()
-	encodedContent := base64Encode(content)
+	encodedContent := base64.StdEncoding.EncodeToString([]byte(content))
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte(`{"content":"` + encodedContent + `"}`)); err != nil {
 		log.Printf("Failed to write response: %v", err)
@@ -194,7 +189,7 @@ func handleUserRequest(w http.ResponseWriter, path string) {
 func handleCollaboratorRequest(w http.ResponseWriter, path string) {
 	// Extract username from path like "/repos/testowner/testrepo/collaborators/username"
 	parts := strings.Split(path, "/")
-	
+
 	if len(parts) < 6 {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -216,10 +211,8 @@ func handleCollaboratorRequest(w http.ResponseWriter, path string) {
 	}
 
 	if collaboratorsWithAccess[username] {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(`{"permission":"write"}`)); err != nil {
-			log.Printf("Failed to write response: %v", err)
-		}
+		// GitHub returns 204 No Content for valid collaborators
+		w.WriteHeader(http.StatusNoContent)
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -245,10 +238,6 @@ func getCodeOwnersContent() string {
 `
 }
 
-func base64Encode(s string) string {
-	return base64.StdEncoding.EncodeToString([]byte(s))
-}
-
 func verifyReviewers(t *testing.T, candidates []ReviewerCandidate, expected []string) {
 	t.Helper()
 	found := make(map[string]bool)
@@ -265,8 +254,8 @@ func verifyReviewers(t *testing.T, candidates []ReviewerCandidate, expected []st
 
 // testTransport rewrites GitHub API URLs to point to our test server
 type testTransport struct {
-	baseURL string
 	rt      http.RoundTripper
+	baseURL string
 }
 
 func (t *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {

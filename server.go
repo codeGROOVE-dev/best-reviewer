@@ -13,12 +13,14 @@ import (
 
 // MetricsCollector tracks metrics for the health endpoint.
 type MetricsCollector struct {
-	mu                sync.RWMutex
 	uniqueOrgs        map[string]bool
 	uniquePRsSeen     map[string]bool
 	uniquePRsModified map[string]bool
 	lastRun           time.Time
+	mu                sync.RWMutex
 	totalRuns         int64
+	pollingMu         sync.Mutex
+	isPolling         bool
 }
 
 // NewMetricsCollector creates a new metrics collector.
@@ -63,11 +65,11 @@ func (m *MetricsCollector) RecordRunComplete() {
 
 // Stats represents collected metrics.
 type Stats struct {
+	LastRun     time.Time
+	TotalRuns   int64
 	Orgs        int
 	PRsSeen     int
 	PRsModified int
-	LastRun     time.Time
-	TotalRuns   int64
 }
 
 // GetStats returns the current statistics.
@@ -84,13 +86,13 @@ func (m *MetricsCollector) GetStats() Stats {
 }
 
 // startHealthServer starts the HTTP server for health checks.
-func startHealthServer(metrics *MetricsCollector) {
+func startHealthServer(metrics *MetricsCollector, rf *ReviewerFinder) {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/_-_/health", func(w http.ResponseWriter, _ *http.Request) {
 		stats := metrics.GetStats()
 
 		status := "ok"
@@ -111,9 +113,49 @@ func startHealthServer(metrics *MetricsCollector) {
 		}
 	})
 
+	http.HandleFunc("/_-_/poll", func(w http.ResponseWriter, _ *http.Request) {
+		// Try to acquire the polling lock
+		if !metrics.pollingMu.TryLock() {
+			// Already polling
+			w.WriteHeader(http.StatusConflict)
+			if _, err := w.Write([]byte("Polling already in progress\n")); err != nil {
+				log.Printf("[ERROR] Failed to write response: %v", err)
+			}
+			return
+		}
+
+		// Mark as polling
+		metrics.isPolling = true
+
+		// Release lock and run polling in background
+		go func() {
+			defer func() {
+				metrics.isPolling = false
+				metrics.pollingMu.Unlock()
+			}()
+
+			log.Print("[POLLZ] Manual poll triggered via /pollz endpoint")
+			ctx := context.Background()
+			startTime := time.Now()
+
+			if err := rf.findAndAssignReviewersForApp(ctx); err != nil {
+				log.Printf("[ERROR] Manual poll failed: %v", err)
+			} else {
+				metrics.RecordRunComplete()
+				duration := time.Since(startTime)
+				log.Printf("[POLLZ] Manual poll completed in %v", duration)
+			}
+		}()
+
+		w.WriteHeader(http.StatusAccepted)
+		if _, err := w.Write([]byte("Poll triggered successfully\n")); err != nil {
+			log.Printf("[ERROR] Failed to write response: %v", err)
+		}
+	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("Better Reviewers Service\nHealth endpoint: /healthz\n")); err != nil {
+		if _, err := w.Write([]byte("Better Reviewers Service\nHealth endpoint: /_-_/health\nTrigger poll: /_-_/poll\n")); err != nil {
 			log.Printf("[ERROR] Failed to write response: %v", err)
 		}
 	})
@@ -137,7 +179,7 @@ func (rf *ReviewerFinder) runServeMode(ctx context.Context, loopDelay time.Durat
 	rf.metrics = metrics
 
 	// Start health server in background
-	go startHealthServer(metrics)
+	go startHealthServer(metrics, rf)
 
 	// Give the server a moment to start
 	time.Sleep(100 * time.Millisecond)
