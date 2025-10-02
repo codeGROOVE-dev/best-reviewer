@@ -1,4 +1,4 @@
-module better-reviewers
+module github.com/codeGROOVE-dev/best-reviewer
 
 go 1.24.0
 

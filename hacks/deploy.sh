@@ -1,16 +1,26 @@
-#!/bin/sh
-GCP_PROJECT="prod-robot"
-GCP_REGION="us-central1"
-APP_ID="reviewer"
-
-# exit if any step fails
+#!/bin/sh -x
+# Deploy the current Go app to Google Cloud run
+#
+# usage:
+#   ./hacks/deploy.sh - deploy the app in the current directory
+#   ./hacks/deploy.sh cmd/server - deploy the app in cmd/server
 set -eux -o pipefail
+test -n $1 && pushd $1
 
-# The Google Artifact Registry repository to create
-export KO_DOCKER_REPO="gcr.io/${GCP_PROJECT}/${APP_ID}"
+PROJECT=${GCP_PROJECT:=chat-bot-army}
+REGISTRY="${PROJECT}"
+REGION="us-central1"
 
-# Publish the code at . to $KO_DOCKER_REPO
-IMAGE="$(ko publish .)"
+APP_NAME=$(basename $(go mod graph | head -n 1 | cut -d" " -f1))
+APP_USER="${APP_NAME}@${PROJECT}.iam.gserviceaccount.com"
+APP_IMAGE="gcr.io/${REGISTRY}/${APP_NAME}"
 
-# Deploy the newly built binary to Google Cloud Run
-gcloud run deploy "${APP_ID}" --image="${IMAGE}" --region "${GCP_REGION}" --project "${GCP_PROJECT}"
+gcloud iam service-accounts list --project "${PROJECT}" | grep -q "${APP_USER}" ||
+	gcloud iam service-accounts create "${APP_NAME}" --project "${PROJECT}"
+
+export KO_DOCKER_REPO="${APP_IMAGE}"
+gcloud run deploy "${APP_NAME}" \
+	--image="$(ko publish .)" \
+	--region="${REGION}" \
+	--service-account="${APP_USER}" \
+	--project "${PROJECT}"
