@@ -13,14 +13,15 @@ import (
 
 // ReviewerFinder finds and assigns reviewers to pull requests.
 type ReviewerFinder struct {
-	client       *GitHubClient
-	output       *outputFormatter
-	metrics      *MetricsCollector
-	minOpenTime  time.Duration
-	maxOpenTime  time.Duration
-	maxPRs       int
-	prCountCache time.Duration
-	dryRun       bool
+	client           *GitHubClient
+	output           *outputFormatter
+	metrics          *MetricsCollector
+	minOpenTime      time.Duration
+	maxOpenTime      time.Duration
+	maxPRs           int
+	prCountCache     time.Duration
+	dryRun           bool
+	sprinklerMonitor *sprinklerMonitor
 }
 
 // findAndAssignReviewers is the main entry point for finding and assigning reviewers.
@@ -599,6 +600,14 @@ func (rf *ReviewerFinder) startAppPolling(ctx context.Context, interval time.Dur
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Initialize sprinkler monitor if available
+	if rf.sprinklerMonitor != nil {
+		if err := rf.initSprinklerOrgs(ctx); err != nil {
+			log.Printf("[SPRINKLER] Failed to initialize organizations: %v", err)
+		}
+		defer rf.sprinklerMonitor.stop()
+	}
+
 	// Run immediately
 	if err := rf.findAndAssignReviewersForApp(ctx); err != nil {
 		log.Printf("Error in initial app run: %v", err)
@@ -615,4 +624,32 @@ func (rf *ReviewerFinder) startAppPolling(ctx context.Context, interval time.Dur
 			}
 		}
 	}
+}
+
+// initSprinklerOrgs fetches the app installations and starts sprinkler monitoring.
+func (rf *ReviewerFinder) initSprinklerOrgs(ctx context.Context) error {
+	if rf.sprinklerMonitor == nil {
+		return errors.New("sprinkler monitor not initialized")
+	}
+
+	log.Print("[SPRINKLER] Fetching app installations")
+	orgs, err := rf.client.listAppInstallations(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list app installations: %w", err)
+	}
+
+	if len(orgs) == 0 {
+		log.Print("[SPRINKLER] No organizations found, sprinkler will not start")
+		return nil
+	}
+
+	log.Printf("[SPRINKLER] Discovered %d organizations: %v", len(orgs), orgs)
+
+	// Update sprinkler with all orgs at once
+	rf.sprinklerMonitor.updateOrgs(orgs)
+	if err := rf.sprinklerMonitor.start(ctx); err != nil {
+		return fmt.Errorf("start sprinkler: %w", err)
+	}
+
+	return nil
 }

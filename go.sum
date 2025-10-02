@@ -1,4 +1,8 @@
 github.com/codeGROOVE-dev/retry v1.2.0 h1:xYpYPX2PQZmdHwuiQAGGzsBm392xIMl4nfMEFApQnu8=
 github.com/codeGROOVE-dev/retry v1.2.0/go.mod h1:8OgefgV1XP7lzX2PdKlCXILsYKuz6b4ZpHa/20iLi8E=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001154245-068712aa969d h1:tQX67dAzyWVAaNe0EhYpj/AmWZo1Wwhaah6KVj7M3qs=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001154245-068712aa969d/go.mod h1:RZ/Te7HkY5upHQlnmf3kV4GHVM0R8AK3U+yPItCZAoQ=
 github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
 github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
+golang.org/x/net v0.44.0 h1:evd8IRDyfNBMBTTY5XRF1vaZlD+EmWx6x8PkhR04H/I=
+golang.org/x/net v0.44.0/go.mod h1:ECOoLqd5U3Lhyeyo/QDCEVQ4sNgYsqvCZ722XogGieY=

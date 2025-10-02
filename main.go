@@ -86,6 +86,13 @@ func main() {
 		output:       &outputFormatter{verbose: true},
 	}
 
+	// Initialize sprinkler monitor if using app auth
+	if useAppAuth {
+		token := client.getToken()
+		finder.sprinklerMonitor = newSprinklerMonitor(finder, token)
+		log.Print("[SPRINKLER] Sprinkler monitor initialized")
+	}
+
 	// Handle different execution modes
 	switch {
 	case *serve:

@@ -185,6 +185,15 @@ func (rf *ReviewerFinder) runServeMode(ctx context.Context, loopDelay time.Durat
 	time.Sleep(100 * time.Millisecond)
 	log.Printf("[SERVER] Service started in serve mode with loop delay: %v", loopDelay)
 
+	// Initialize and start sprinkler monitor if available
+	if rf.sprinklerMonitor != nil {
+		// Fetch organizations and start monitoring
+		if err := rf.initSprinklerOrgs(ctx); err != nil {
+			log.Printf("[SPRINKLER] Failed to initialize organizations: %v", err)
+		}
+		defer rf.sprinklerMonitor.stop()
+	}
+
 	// Run immediately, then loop
 	for {
 		select {

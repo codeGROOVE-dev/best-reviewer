@@ -440,6 +440,13 @@ func (c *GitHubClient) isUserAccount(account string) bool {
 	return c.installationTypes[account] == "User"
 }
 
+// token returns the current authentication token (JWT for app auth, PAT otherwise).
+func (c *GitHubClient) getToken() string {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.token
+}
+
 // getInstallationToken gets or refreshes an installation access token for an organization.
 func (c *GitHubClient) getInstallationToken(ctx context.Context, org string) (string, error) {
 	if !c.isAppAuth {

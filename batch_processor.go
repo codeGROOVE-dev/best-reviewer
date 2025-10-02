@@ -78,7 +78,8 @@ func (rf *ReviewerFinder) processPRsBatch(ctx context.Context, prs []*PullReques
 	}
 
 	// Print overall summary
-	log.Printf("\n" + rf.output.formatSummary(totalProcessed, totalAssigned, totalSkipped))
+	summary := rf.output.formatSummary(totalProcessed, totalAssigned, totalSkipped)
+	log.Printf("\n%s", summary)
 }
 
 // groupPRsByRepository groups PRs by their repository.
