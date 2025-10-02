@@ -24,8 +24,8 @@ const (
 
 // UserCache provides caching for user information.
 type UserCache struct {
-	users map[string]*UserInfo
 	mu    sync.RWMutex
+	users map[string]*UserInfo
 }
 
 // UserInfo holds cached information about a GitHub user.
@@ -55,6 +55,29 @@ func (uc *UserCache) Set(username string, info *UserInfo) {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 	uc.users[username] = info
+}
+
+// CacheUserTypeFromGraphQL caches user type information from GraphQL responses.
+func (c *Client) CacheUserTypeFromGraphQL(username, typeName string) {
+	if c.userCache == nil || username == "" {
+		return
+	}
+
+	isBot := false
+	switch typeName {
+	case "Bot":
+		isBot = true
+	case "Organization":
+		isBot = false
+	default:
+		isBot = c.IsUserBot(context.Background(), username)
+	}
+
+	info := &UserInfo{
+		IsBot:      isBot,
+		LastUpdate: time.Now(),
+	}
+	c.userCache.Set(username, info)
 }
 
 // IsUserBot checks if a user is a bot.
@@ -141,12 +164,12 @@ func (c *Client) HasWriteAccess(ctx context.Context, owner, repo, username strin
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators/%s", owner, repo, username)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
-		slog.Info("[WARN] Failed to check write access for %s: %v", username, err)
+		slog.Warn("Failed to check write access for user", "username", username, "error", err)
 		return false // Fail closed - assume no access on error
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -165,7 +188,7 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 	cacheKey := makeCacheKey("pr-count", org, user)
 	if cached, found := c.cache.Get(cacheKey); found {
 		if count, ok := cached.(int); ok {
-			slog.Info("    [CACHE] User %s has %d non-stale open PRs in org %s (cached)", user, count, org)
+			slog.Info("User has non-stale open PRs in org (cached)", "user", user, "count", count, "org", org)
 			return count, nil
 		}
 	}
@@ -181,7 +204,7 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 		return 0, fmt.Errorf("invalid organization (%s) or user (%s)", org, user)
 	}
 
-	slog.Info("  [API] Fetching open PR count for user %s in org %s", user, org)
+	slog.Info("Fetching open PR count for user in org", "component", "api", "user", user, "org", org)
 
 	// Create a context with shorter timeout for PR count queries to avoid hanging
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -194,29 +217,29 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 	// Only count PRs updated within the last 90 days to exclude stale PRs
 	// First, search for PRs where user is assigned
 	assignedQuery := fmt.Sprintf("is:pr is:open org:%s assignee:%s updated:>=%s", org, user, cutoffDate)
-	slog.Info("  [DEBUG] Searching assigned PRs for %s (updated since %s)", user, cutoffDate)
+	slog.Debug("Searching assigned PRs for user", "user", user, "updated_since", cutoffDate)
 	assignedCount, err := c.searchPRCount(timeoutCtx, assignedQuery)
 	if err != nil {
 		// Cache the failure to avoid repeated attempts
 		c.cache.SetWithTTL(failureKey, true, prCountFailureCacheTTL)
 		return 0, fmt.Errorf("failed to get assigned PR count: %w", err)
 	}
-	slog.Info("  [DEBUG] Found %d non-stale assigned PRs for %s", assignedCount, user)
+	slog.Debug("Found non-stale assigned PRs for user", "count", assignedCount, "user", user)
 
 	// Second, search for PRs where user is requested as reviewer
 	reviewQuery := fmt.Sprintf("is:pr is:open org:%s review-requested:%s updated:>=%s", org, user, cutoffDate)
-	slog.Info("  [DEBUG] Searching review-requested PRs for %s (updated since %s)", user, cutoffDate)
+	slog.Debug("Searching review-requested PRs for user", "user", user, "updated_since", cutoffDate)
 	reviewCount, err := c.searchPRCount(timeoutCtx, reviewQuery)
 	if err != nil {
 		// Cache the failure to avoid repeated attempts
 		c.cache.SetWithTTL(failureKey, true, prCountFailureCacheTTL)
 		return 0, fmt.Errorf("failed to get review-requested PR count: %w", err)
 	}
-	slog.Info("  [DEBUG] Found %d non-stale review-requested PRs for %s", reviewCount, user)
+	slog.Debug("Found non-stale review-requested PRs for user", "count", reviewCount, "user", user)
 
 	total := assignedCount + reviewCount
 
-	slog.Info("    📊 User %s has %d non-stale open PRs in org %s (%d assigned, %d for review)", user, total, org, assignedCount, reviewCount)
+	slog.Info("User has non-stale open PRs in org", "user", user, "total", total, "org", org, "assigned", assignedCount, "for_review", reviewCount)
 
 	// Cache the successful result
 	c.cache.SetWithTTL(cacheKey, total, cacheTTL)
@@ -228,15 +251,15 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 func (c *Client) searchPRCount(ctx context.Context, query string) (int, error) {
 	encodedQuery := url.QueryEscape(query)
 	apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=1", encodedQuery)
-	slog.Info("  [DEBUG] Search query: %s", query)
-	slog.Info("  [DEBUG] Full URL: %s", apiURL)
+	slog.Debug("Search query", "query", query)
+	slog.Debug("Full URL", "url", apiURL)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -278,11 +301,11 @@ func (c *Client) cachedPR(owner, repo string, prNumber int, expectedUpdatedAt *t
 
 	// If we have an expected updated_at time, validate the cache
 	if expectedUpdatedAt != nil && !pr.UpdatedAt.Equal(*expectedUpdatedAt) {
-		slog.Info("[CACHE] PR %s/%s#%d cache invalidated (updated_at changed)", owner, repo, prNumber)
+		slog.Info("PR cache invalidated (updated_at changed)", "component", "cache", "owner", owner, "repo", repo, "pr", prNumber)
 		return nil, false
 	}
 
-	slog.Info("[CACHE] Using cached PR %s/%s#%d", owner, repo, prNumber)
+	slog.Info("Using cached PR", "component", "cache", "owner", owner, "repo", repo, "pr", prNumber)
 	return pr, true
 }
 
@@ -291,6 +314,56 @@ func (c *Client) cachePR(pr *types.PullRequest) {
 	cacheKey := makeCacheKey("pr", pr.Owner, pr.Repository, fmt.Sprintf("%d", pr.Number))
 	// Use a longer TTL for PR caching (20 days) since we validate with updated_at
 	c.cache.SetWithTTL(cacheKey, pr, 20*24*time.Hour)
+}
+
+// Collaborators returns a list of users with write access to the repository.
+// This includes direct collaborators AND organization members with write access.
+func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]string, error) {
+	cacheKey := makeCacheKey("collaborators", owner, repo)
+	if cached, found := c.cache.Get(cacheKey); found {
+		if collabs, ok := cached.([]string); ok {
+			slog.DebugContext(ctx, "Using cached collaborators", "owner", owner, "repo", repo)
+			return collabs, nil
+		}
+	}
+
+	// Use affiliation=all to include both direct collaborators and org members
+	// permission=push ensures we only get users with write access or higher
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators?affiliation=all&permission=push", owner, repo)
+	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch collaborators: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("Failed to close response body", "error", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch collaborators (status %d)", resp.StatusCode)
+	}
+
+	var collaborators []struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&collaborators); err != nil {
+		return nil, fmt.Errorf("failed to decode collaborators response: %w", err)
+	}
+
+	usernames := make([]string, 0, len(collaborators))
+	for _, collab := range collaborators {
+		if collab.Type != "Bot" {
+			usernames = append(usernames, collab.Login)
+		}
+	}
+
+	c.cache.SetWithTTL(cacheKey, usernames, 6*time.Hour)
+	slog.InfoContext(ctx, "Fetched collaborators", "owner", owner, "repo", repo, "count", len(usernames))
+
+	return usernames, nil
 }
 
 // sanitizeURLForLogging removes sensitive query parameters from URLs.

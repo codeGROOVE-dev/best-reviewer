@@ -32,20 +32,20 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 	// Get the 3 files with the largest delta, excluding lock files
 	topFiles := f.topChangedFilesFiltered(pr, 3)
 	if len(topFiles) == 0 {
-		slog.Info("  ⚠️  No changed files to analyze")
+		slog.Info("No changed files to analyze")
 		return nil // Return nil to trigger fallback
 	}
 
-	slog.Info("  📊 Analyzing top %d files with largest changes", len(topFiles))
+	slog.Info("Analyzing top files with largest changes", "count", len(topFiles))
 
 	// Collect candidates with weights from recent PRs that modified these files
 	candidates := f.collectWeightedCandidates(ctx, pr, topFiles)
 	if len(candidates) == 0 {
-		slog.Info("  ⚠️  No candidates found from file history")
+		slog.Info("No candidates found from file history")
 		return nil // Return nil to trigger fallback
 	}
 
-	slog.Info("  👥 Found %d weighted candidates from file history", len(candidates))
+	slog.Info("Found weighted candidates from file history", "count", len(candidates))
 
 	// Get recent contributors for the repository with progressive time windows
 	windows := []int{recencyWindow1, recencyWindow2, recencyWindow3, recencyWindow4}
@@ -54,11 +54,11 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 	for _, days := range windows {
 		contributors := f.recentContributors(ctx, pr.Owner, pr.Repository, days)
 		if len(contributors) == 0 {
-			slog.Info("  ⏱️  No contributors found in %d day window, expanding...", days)
+			slog.Info("No contributors found in day window, expanding", "days", days)
 			continue
 		}
 
-		slog.Info("  ⏱️  Found %d contributors in %d day window", len(contributors), days)
+		slog.Info("Found contributors in day window", "count", len(contributors), "days", days)
 
 		// Create a map for quick lookup
 		contributorMap := make(map[string]bool)
@@ -73,11 +73,11 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 			break
 		}
 
-		slog.Info("  🎲 No successful rolls in %d day window, expanding...", days)
+		slog.Info("No successful rolls in day window, expanding", "days", days)
 	}
 
 	if len(selectedReviewers) == 0 {
-		slog.Info("  ⚠️  No reviewers found with recency bias, falling back")
+		slog.Info("No reviewers found with recency bias, falling back")
 		return nil // Return nil to trigger fallback
 	}
 
@@ -126,7 +126,7 @@ func (f *Finder) topChangedFilesFiltered(pr *types.PullRequest, n int) []string 
 			break
 		}
 		files = append(files, fc.name)
-		slog.Info("    File %d: %s (%d changes)", i+1, fc.name, fc.changes)
+		slog.Info("File with changes", "index", i+1, "filename", fc.name, "changes", fc.changes)
 	}
 
 	return files
@@ -140,7 +140,7 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 		// Get the most recent PRs that modified this file
 		historicalPRs, err := f.historicalPRsForFile(ctx, pr.Owner, pr.Repository, file, maxHistoricalPRs)
 		if err != nil {
-			slog.Info("    ⚠️  Failed to get history for %s: %v", file, err)
+			slog.Warn("Failed to get history for file", "file", file, "error", err)
 			continue
 		}
 
@@ -207,7 +207,7 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 		if i >= topCandidatesToLog {
 			break
 		}
-		slog.Info("    Candidate: %s (weight: %d lines, source: %s)", c.username, c.weight, c.source)
+		slog.Info("Candidate", "username", c.username, "weight", c.weight, "source", c.source)
 	}
 
 	return candidates
@@ -236,7 +236,7 @@ func (f *Finder) recentContributors(ctx context.Context, owner, repo string, day
 	}
 
 	cutoff := time.Now().AddDate(0, 0, -days)
-	slog.Info("  🔍 Fetching contributors active since %s (%d days ago)", cutoff.Format("2006-01-02"), days)
+	slog.Info("Fetching contributors active since cutoff", "cutoff", cutoff.Format("2006-01-02"), "days_ago", days)
 
 	// TODO: Use GraphQL to get recent PRs efficiently
 	// For now, return empty to trigger fallback
@@ -265,7 +265,7 @@ func (f *Finder) performWeightedSelection(
 		bigWeight := big.NewInt(int64(totalWeight))
 		bigRoll, err := rand.Int(rand.Reader, bigWeight)
 		if err != nil {
-			slog.Info("    ⚠️  Failed to generate random number: %v", err)
+			slog.Warn("Failed to generate random number", "error", err)
 			continue
 		}
 		roll := int(bigRoll.Int64())
@@ -277,23 +277,23 @@ func (f *Finder) performWeightedSelection(
 			if roll < cumulative {
 				// Check if this candidate is a recent contributor
 				if !recentContributors[c.username] {
-					slog.Info("    🎲 Roll %d: %s (weight: %d) - not recent, skipping", i+1, c.username, c.weight)
+					slog.Info("Roll - not recent, skipping", "roll", i+1, "username", c.username, "weight", c.weight)
 					break
 				}
 
 				// Check if already selected
 				if _, exists := selectedMap[c.username]; exists {
-					slog.Info("    🎲 Roll %d: %s (weight: %d) - already selected", i+1, c.username, c.weight)
+					slog.Info("Roll - already selected", "roll", i+1, "username", c.username, "weight", c.weight)
 					break
 				}
 
 				// Validate the reviewer
 				if !f.isValidReviewer(ctx, pr, c.username) {
-					slog.Info("    🎲 Roll %d: %s (weight: %d) - invalid reviewer", i+1, c.username, c.weight)
+					slog.Info("Roll - invalid reviewer", "roll", i+1, "username", c.username, "weight", c.weight)
 					break
 				}
 
-				slog.Info("    ✅ Roll %d: Selected %s (weight: %d, source: %s)", i+1, c.username, c.weight, c.source)
+				slog.Info("Roll - selected", "roll", i+1, "username", c.username, "weight", c.weight, "source", c.source)
 
 				// Add to selected
 				method := SelectionAuthorOverlap

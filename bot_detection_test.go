@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestIsUserBot(t *testing.T) {
@@ -114,6 +115,11 @@ func TestIsValidReviewer(t *testing.T) {
 	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "johndoe"), 5, prCountCacheTTL)
 	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "sergiodj"), 3, prCountCacheTTL)
 	mockClient.cache.setWithTTL(makeCacheKey("pr-count", "test", "busyuser"), 10, prCountCacheTTL) // Over limit
+
+	// Mock write access for test users
+	mockClient.cache.setWithTTL(makeCacheKey("write-access", "test", "repo", "johndoe"), true, 6*time.Hour)
+	mockClient.cache.setWithTTL(makeCacheKey("write-access", "test", "repo", "sergiodj"), true, 6*time.Hour)
+	mockClient.cache.setWithTTL(makeCacheKey("write-access", "test", "repo", "busyuser"), true, 6*time.Hour)
 
 	ctx := context.Background()
 	pr := &PullRequest{Owner: "test", Repository: "repo"}

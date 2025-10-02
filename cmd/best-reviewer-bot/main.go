@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -18,11 +19,11 @@ import (
 )
 
 var (
-	// GitHub App authentication flags
+	// GitHub App authentication flags.
 	appID      = flag.String("app-id", "", "GitHub App ID for authentication")
 	appKeyPath = flag.String("app-key-path", "", "Path to GitHub App private key file")
 
-	// Behavior flags
+	// Behavior flags.
 	serve        = flag.Bool("serve", false, "Run in server mode with health endpoint")
 	loopDelay    = flag.Duration("loop-delay", 5*time.Minute, "Loop delay in serve mode (default: 5m)")
 	dryRun       = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
@@ -309,7 +310,7 @@ func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, review
 	_ = payload
 	_ = ctx
 
-	return fmt.Errorf("not implemented - needs github.Client.AddReviewers method")
+	return errors.New("not implemented - needs github.Client.AddReviewers method")
 }
 
 // listOrgRepos lists all repositories for an organization.
@@ -318,7 +319,7 @@ func (b *Bot) listOrgRepos(ctx context.Context, org string) ([]string, error) {
 	// For now, return empty list
 	_ = ctx
 	_ = org
-	return []string{}, fmt.Errorf("not implemented - needs github.Client.ListOrgRepos method")
+	return []string{}, errors.New("not implemented - needs github.Client.ListOrgRepos method")
 }
 
 // runServeMode runs the bot in server mode with periodic execution.
@@ -385,26 +386,29 @@ func (b *Bot) startHealthServer() {
 			stats.LastRun.Format(time.RFC3339), stats.TotalRuns)
 
 		w.WriteHeader(statusCode)
-		w.Write([]byte(response))
+		if _, err := w.Write([]byte(response)); err != nil {
+			slog.Warn("Failed to write response", "error", err)
+		}
 	})
 
 	http.HandleFunc("/_-_/poll", func(w http.ResponseWriter, _ *http.Request) {
 		if !b.metrics.pollingMu.TryLock() {
 			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte("Polling already in progress\n"))
+			if _, err := w.Write([]byte("Polling already in progress\n")); err != nil {
+				slog.Warn("Failed to write response", "error", err)
+			}
 			return
 		}
 
 		b.metrics.isPolling = true
 
-		go func() {
+		go func(ctx context.Context) {
 			defer func() {
 				b.metrics.isPolling = false
 				b.metrics.pollingMu.Unlock()
 			}()
 
 			slog.Info("Manual poll triggered")
-			ctx := context.Background()
 			startTime := time.Now()
 
 			if err := b.processAllOrgs(ctx); err != nil {
@@ -413,15 +417,19 @@ func (b *Bot) startHealthServer() {
 				b.metrics.RecordRunComplete()
 				slog.Info("Manual poll completed", "duration", time.Since(startTime))
 			}
-		}()
+		}(context.Background())
 
 		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte("Poll triggered\n"))
+		if _, err := w.Write([]byte("Poll triggered\n")); err != nil {
+			slog.Warn("Failed to write response", "error", err)
+		}
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Best Reviewer Bot\n/_-_/health - Health status\n/_-_/poll - Trigger manual poll\n"))
+		if _, err := w.Write([]byte("Best Reviewer Bot\n/_-_/health - Health status\n/_-_/poll - Trigger manual poll\n")); err != nil {
+			slog.Warn("Failed to write response", "error", err)
+		}
 	})
 
 	slog.Info("Starting health server", "port", port)

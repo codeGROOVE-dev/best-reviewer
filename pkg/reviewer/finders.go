@@ -14,7 +14,7 @@ func (f *Finder) findDirectoryAuthor(ctx context.Context, pr *types.PullRequest,
 	for _, dir := range dirs {
 		if author := f.findRecentAuthorInDirectory(ctx, pr.Owner, pr.Repository, dir); author != "" {
 			if author == pr.Author {
-				slog.Info("    Filtered (is PR author): %s", author)
+				slog.Info("Filtered (is PR author)", "author", author)
 				continue
 			}
 			if f.isValidReviewer(ctx, pr, author) {
@@ -32,7 +32,7 @@ func (f *Finder) findProjectAuthor(ctx context.Context, pr *types.PullRequest) s
 
 	for _, author := range authors {
 		if author == pr.Author {
-			slog.Info("    Filtered (is PR author): %s", author)
+			slog.Info("Filtered (is PR author)", "author", author)
 			continue
 		}
 		if f.isValidReviewer(ctx, pr, author) {
@@ -50,11 +50,11 @@ func (f *Finder) findDirectoryReviewer(ctx context.Context, pr *types.PullReques
 	for _, dir := range dirs {
 		if reviewer := f.findActiveReviewerInDirectory(ctx, pr.Owner, pr.Repository, dir); reviewer != "" {
 			if reviewer == pr.Author {
-				slog.Info("    Filtered (is PR author): %s", reviewer)
+				slog.Info("Filtered (is PR author)", "reviewer", reviewer)
 				continue
 			}
 			if reviewer == excludeAuthor {
-				slog.Info("    Filtered (is excluded author): %s", reviewer)
+				slog.Info("Filtered (is excluded author)", "reviewer", reviewer)
 				continue
 			}
 			if f.isValidReviewer(ctx, pr, reviewer) {
@@ -72,11 +72,11 @@ func (f *Finder) findProjectReviewer(ctx context.Context, pr *types.PullRequest,
 
 	for _, reviewer := range reviewers {
 		if reviewer == pr.Author {
-			slog.Info("    Filtered (is PR author): %s", reviewer)
+			slog.Info("Filtered (is PR author)", "reviewer", reviewer)
 			continue
 		}
 		if reviewer == excludeAuthor {
-			slog.Info("    Filtered (is excluded author): %s", reviewer)
+			slog.Info("Filtered (is excluded author)", "reviewer", reviewer)
 			continue
 		}
 		if f.isValidReviewer(ctx, pr, reviewer) {

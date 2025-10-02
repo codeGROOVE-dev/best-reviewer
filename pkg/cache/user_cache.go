@@ -8,6 +8,7 @@ import (
 // UserType represents the type of GitHub account.
 type UserType string
 
+// GitHub account types.
 const (
 	UserTypeUser UserType = "User"
 	UserTypeOrg  UserType = "Organization"

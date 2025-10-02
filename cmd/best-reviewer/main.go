@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -109,12 +110,36 @@ func main() {
 	}
 	fmt.Println()
 
+	// Get all project collaborators for context
+	collaborators, err := client.Collaborators(ctx, owner, repo)
+	if err != nil {
+		slog.Warn("Failed to fetch collaborators", "error", err)
+		// Continue without collaborator list
+	}
+
 	// Find reviewers
 	slog.Info("Finding best reviewers")
 	candidates, err := finder.Find(ctx, pr)
 	if err != nil {
 		slog.Error("Failed to find reviewers", "error", err)
 		os.Exit(1)
+	}
+
+	// Display collaborators if available
+	if len(collaborators) > 0 {
+		// Filter out bots from display
+		validCollaborators := make([]string, 0, len(collaborators))
+		for _, collab := range collaborators {
+			if !client.IsUserBot(ctx, collab) {
+				validCollaborators = append(validCollaborators, collab)
+			}
+		}
+
+		if len(validCollaborators) > 0 {
+			fmt.Printf("👥 Project Collaborators (%d):\n   ", len(validCollaborators))
+			fmt.Println(strings.Join(validCollaborators, ", "))
+			fmt.Println()
+		}
 	}
 
 	// Display results
@@ -149,11 +174,11 @@ func parsePRURL(url string) (owner, repo string, prNumber int, err error) {
 	if strings.Contains(url, "#") && !strings.Contains(url, "://") {
 		parts := strings.Split(url, "#")
 		if len(parts) != 2 {
-			return "", "", 0, fmt.Errorf("invalid PR shorthand format (expected owner/repo#number)")
+			return "", "", 0, errors.New("invalid PR shorthand format (expected owner/repo#number)")
 		}
 		repoPath := strings.Split(parts[0], "/")
 		if len(repoPath) != 2 {
-			return "", "", 0, fmt.Errorf("invalid repository path (expected owner/repo)")
+			return "", "", 0, errors.New("invalid repository path (expected owner/repo)")
 		}
 		_, err := fmt.Sscanf(parts[1], "%d", &prNumber)
 		if err != nil {
@@ -168,7 +193,7 @@ func parsePRURL(url string) (owner, repo string, prNumber int, err error) {
 		url = strings.TrimPrefix(url, "http://github.com/")
 		parts := strings.Split(url, "/")
 		if len(parts) < 4 || parts[2] != "pull" {
-			return "", "", 0, fmt.Errorf("invalid GitHub PR URL format")
+			return "", "", 0, errors.New("invalid GitHub PR URL format")
 		}
 		_, err := fmt.Sscanf(parts[3], "%d", &prNumber)
 		if err != nil {
@@ -177,7 +202,7 @@ func parsePRURL(url string) (owner, repo string, prNumber int, err error) {
 		return parts[0], parts[1], prNumber, nil
 	}
 
-	return "", "", 0, fmt.Errorf("invalid PR URL format (use: https://github.com/owner/repo/pull/123 or owner/repo#123)")
+	return "", "", 0, errors.New("invalid PR URL format (use: https://github.com/owner/repo/pull/123 or owner/repo#123)")
 }
 
 // getGitHubToken retrieves the GitHub token from gh CLI.

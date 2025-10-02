@@ -128,14 +128,13 @@ func startHealthServer(metrics *MetricsCollector, rf *ReviewerFinder) {
 		metrics.isPolling = true
 
 		// Release lock and run polling in background
-		go func() {
+		go func(ctx context.Context) {
 			defer func() {
 				metrics.isPolling = false
 				metrics.pollingMu.Unlock()
 			}()
 
 			log.Print("[POLLZ] Manual poll triggered via /pollz endpoint")
-			ctx := context.Background()
 			startTime := time.Now()
 
 			if err := rf.findAndAssignReviewersForApp(ctx); err != nil {
@@ -145,7 +144,7 @@ func startHealthServer(metrics *MetricsCollector, rf *ReviewerFinder) {
 				duration := time.Since(startTime)
 				log.Printf("[POLLZ] Manual poll completed in %v", duration)
 			}
-		}()
+		}(context.Background())
 
 		w.WriteHeader(http.StatusAccepted)
 		if _, err := w.Write([]byte("Poll triggered successfully\n")); err != nil {

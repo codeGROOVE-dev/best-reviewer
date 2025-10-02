@@ -1039,6 +1039,14 @@ func (*ReviewerFinder) isUserBot(_ context.Context, username string) bool {
 
 // hasWriteAccess checks if a user has write access to the repository.
 func (rf *ReviewerFinder) hasWriteAccess(ctx context.Context, owner, repo, username string) bool {
+	// Check cache first to support testing
+	cacheKey := makeCacheKey("write-access", owner, repo, username)
+	if cached, found := rf.client.cache.value(cacheKey); found {
+		if hasAccess, ok := cached.(bool); ok {
+			return hasAccess
+		}
+	}
+
 	// Check if user is a collaborator with write access
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators/%s", owner, repo, username)
 	resp, err := rf.client.makeRequest(ctx, httpMethodGet, apiURL, nil)
@@ -1054,11 +1062,12 @@ func (rf *ReviewerFinder) hasWriteAccess(ctx context.Context, owner, repo, usern
 
 	// GitHub returns 204 No Content if user is a collaborator
 	// Returns 404 if not a collaborator
-	if resp.StatusCode == http.StatusNoContent {
-		return true
-	}
+	hasAccess := resp.StatusCode == http.StatusNoContent
 
-	return false
+	// Cache the result
+	rf.client.cache.setWithTTL(cacheKey, hasAccess, 6*time.Hour)
+
+	return hasAccess
 }
 
 // openPRCount returns the number of open PRs assigned to or requested for review by a user in an organization.

@@ -13,15 +13,15 @@ import (
 
 // ReviewerFinder finds and assigns reviewers to pull requests.
 type ReviewerFinder struct {
+	minOpenTime      time.Duration
+	maxOpenTime      time.Duration
+	prCountCache     time.Duration
 	client           *GitHubClient
 	output           *outputFormatter
 	metrics          *MetricsCollector
-	minOpenTime      time.Duration
-	maxOpenTime      time.Duration
-	maxPRs           int
-	prCountCache     time.Duration
-	dryRun           bool
 	sprinklerMonitor *sprinklerMonitor
+	maxPRs           int
+	dryRun           bool
 }
 
 // findAndAssignReviewers is the main entry point for finding and assigning reviewers.

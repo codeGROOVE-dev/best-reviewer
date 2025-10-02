@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -57,9 +56,8 @@ func (s *SimplifiedScorer) scoreContributors(ctx context.Context, pr *types.Pull
 		if i >= topCandidatesToLog {
 			break
 		}
-		slog.Info("    Candidate %d: %s (score: %.2f | overlap: %.1f, recency: %.1f, expertise: %.1f)",
-			i+1, score.Username, score.Score,
-			score.Factors["file_overlap"], score.Factors["recency"], score.Factors["expertise"])
+		slog.Info("Candidate scored", "rank", i+1, "username", score.Username, "score", score.Score,
+			"file_overlap", score.Factors["file_overlap"], "recency", score.Factors["recency"], "expertise", score.Factors["expertise"])
 	}
 
 	return scores
@@ -273,12 +271,16 @@ func (f *Finder) topContributors(ctx context.Context, owner, repo string) []Cont
 
 	// Fetch from GitHub API
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contributors?per_page=30", owner, repo)
-	resp, err := f.makeHTTPRequest(ctx, httpMethodGet, url, nil)
+	resp, err := f.client.MakeRequest(ctx, httpMethodGet, url, nil)
 	if err != nil {
-		slog.Info("  ⚠️  Failed to fetch contributors: %v", err)
+		slog.Warn("Failed to fetch contributors", "error", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Warn("Failed to close response body", "error", err)
+		}
+	}()
 
 	var apiContributors []struct {
 		Login         string `json:"login"`
@@ -286,7 +288,7 @@ func (f *Finder) topContributors(ctx context.Context, owner, repo string) []Cont
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&apiContributors); err != nil {
-		slog.Info("  ⚠️  Failed to decode contributors: %v", err)
+		slog.Warn("Failed to decode contributors", "error", err)
 		return nil
 	}
 
@@ -298,17 +300,17 @@ func (f *Finder) topContributors(ctx context.Context, owner, repo string) []Cont
 		if activity, exists := userActivities[ac.Login]; exists {
 			lastActivity = activity.LastActivity
 			daysSince := int(time.Since(lastActivity).Hours() / 24)
-			slog.Info("    �� %s last active %d days ago (%s)", ac.Login, daysSince, activity.Source)
+			slog.Debug("User last active", "username", ac.Login, "days_ago", daysSince, "source", activity.Source)
 		} else {
 			// No recent activity found
 			lastActivity = time.Now().Add(-365 * 24 * time.Hour) // Default to 1 year ago
-			slog.Info("    ⚠️  No recent activity found for %s", ac.Login)
+			slog.Debug("No recent activity found for user", "username", ac.Login)
 		}
 
 		// Filter out users who haven't been active in over 90 days
 		daysSince := time.Since(lastActivity).Hours() / 24
 		if daysSince > quarterlyDaysThreshold {
-			slog.Info("    ⏭️  Skipping %s (inactive for %d days)", ac.Login, int(daysSince))
+			slog.Debug("Skipping inactive user", "username", ac.Login, "inactive_days", int(daysSince))
 			continue
 		}
 
@@ -323,14 +325,6 @@ func (f *Finder) topContributors(ctx context.Context, owner, repo string) []Cont
 	f.cache.SetWithTTL(cacheKey, contributors, repoContributorsCacheTTL)
 
 	return contributors
-}
-
-// makeHTTPRequest is a thin wrapper around the github client's HTTP request method.
-// This is needed because the github.Client doesn't expose a generic HTTP request method.
-func (f *Finder) makeHTTPRequest(ctx context.Context, method, url string, body any) (*http.Response, error) {
-	// TODO: This should use the github client's underlying HTTP client
-	// For now, we'll need to add this method to the github.Client or work around it
-	return nil, fmt.Errorf("makeHTTPRequest not yet implemented - needs github.Client enhancement")
 }
 
 // uniqueDirectories extracts unique directories from changed files, sorted by specificity.

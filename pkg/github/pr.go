@@ -30,7 +30,7 @@ func (c *Client) pullRequestWithUpdatedAt(
 		return pr, nil
 	}
 
-	slog.Info("[API] Fetching PR details for %s/%s#%d to get title, state, author, assignees, reviewers, and metadata", owner, repo, prNumber)
+	slog.Info("Fetching PR details to get title, state, author, assignees, reviewers, and metadata", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, prNumber)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -38,7 +38,7 @@ func (c *Client) pullRequestWithUpdatedAt(
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -73,12 +73,12 @@ func (c *Client) pullRequestWithUpdatedAt(
 
 	createdAt, err := time.Parse(time.RFC3339, prData.CreatedAt)
 	if err != nil {
-		slog.Info("[WARN] Failed to parse created_at time: %v", err)
+		slog.Warn("Failed to parse created_at time", "error", err)
 		createdAt = time.Now()
 	}
 	updatedAt, err := time.Parse(time.RFC3339, prData.UpdatedAt)
 	if err != nil {
-		slog.Info("[WARN] Failed to parse updated_at time: %v", err)
+		slog.Warn("Failed to parse updated_at time", "error", err)
 		updatedAt = time.Now()
 	}
 
@@ -116,7 +116,7 @@ func (c *Client) pullRequestWithUpdatedAt(
 	// Get last commit time
 	lastCommit, err := c.lastCommitTime(ctx, owner, repo, prData.Head.SHA)
 	if err != nil {
-		slog.Info("[WARN] Failed to get last commit time for PR %d: %v (degrading gracefully)", prNumber, err)
+		slog.Warn("Failed to get last commit time for PR (degrading gracefully)", "pr", prNumber, "error", err)
 		pr.LastCommit = updatedAt // Fallback to updated time
 	} else {
 		pr.LastCommit = lastCommit
@@ -125,7 +125,7 @@ func (c *Client) pullRequestWithUpdatedAt(
 	// Get last review time
 	lastReview, err := c.lastReviewTime(ctx, owner, repo, prNumber)
 	if err != nil {
-		slog.Info("[WARN] Failed to get last review time for PR %d: %v (degrading gracefully)", prNumber, err)
+		slog.Warn("Failed to get last review time for PR (degrading gracefully)", "pr", prNumber, "error", err)
 		// Leave LastReview as zero value if we can't get it
 	} else {
 		pr.LastReview = lastReview
@@ -139,12 +139,12 @@ func (c *Client) pullRequestWithUpdatedAt(
 
 // OpenPullRequests fetches all open pull requests for a repository.
 func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*types.PullRequest, error) {
-	slog.Info("[API] Fetching all open PRs for repository %s/%s to identify candidates for reviewer assignment", owner, repo)
+	slog.Info("Fetching all open PRs for repository to identify candidates for reviewer assignment", "component", "api", "owner", owner, "repo", repo)
 	var allPRs []*types.PullRequest
 	page := 1
 
 	for {
-		slog.Info("[API] Requesting page %d of open PRs for %s/%s (pagination)", page, owner, repo)
+		slog.Info("Requesting page of open PRs (pagination)", "component", "api", "owner", owner, "repo", repo, "page", page)
 		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls?state=open&per_page=100&page=%d", owner, repo, page)
 
 		// Extract API call to avoid defer in loop
@@ -155,7 +155,7 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 			}
 			defer func() {
 				if err := resp.Body.Close(); err != nil {
-					slog.Info("[WARN] Failed to close response body: %v", err)
+					slog.Warn("Failed to close response body", "error", err)
 				}
 			}()
 
@@ -188,7 +188,7 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 
 			pr, err := c.PullRequest(ctx, owner, repo, prData.Number)
 			if err != nil {
-				slog.Info("[ERROR] Failed to get PR %d details: %v (skipping)", prData.Number, err)
+				slog.Error("Failed to get PR details (skipping)", "pr", prData.Number, "error", err)
 				continue
 			}
 
@@ -206,7 +206,7 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 
 // ChangedFiles fetches the list of changed files in a PR.
 func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber int) ([]types.ChangedFile, error) {
-	slog.Info("[API] Fetching changed files for PR %s/%s#%d to determine modified files for reviewer expertise matching", owner, repo, prNumber)
+	slog.Info("Fetching changed files for PR to determine modified files for reviewer expertise matching", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -214,7 +214,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -244,7 +244,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 
 // lastCommitTime returns the timestamp of the last commit.
 func (c *Client) lastCommitTime(ctx context.Context, owner, repo, sha string) (time.Time, error) {
-	slog.Info("[API] Fetching commit details for %s/%s@%s to get last commit timestamp for PR staleness analysis", owner, repo, sha)
+	slog.Info("Fetching commit details to get last commit timestamp for PR staleness analysis", "component", "api", "owner", owner, "repo", repo, "sha", sha)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", owner, repo, sha)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -252,7 +252,7 @@ func (c *Client) lastCommitTime(ctx context.Context, owner, repo, sha string) (t
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -273,7 +273,7 @@ func (c *Client) lastCommitTime(ctx context.Context, owner, repo, sha string) (t
 
 // lastReviewTime returns the timestamp of the last review.
 func (c *Client) lastReviewTime(ctx context.Context, owner, repo string, prNumber int) (time.Time, error) {
-	slog.Info("[API] Fetching review history for PR %s/%s#%d to determine last review timestamp for staleness detection", owner, repo, prNumber)
+	slog.Info("Fetching review history for PR to determine last review timestamp for staleness detection", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -281,7 +281,7 @@ func (c *Client) lastReviewTime(ctx context.Context, owner, repo string, prNumbe
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 

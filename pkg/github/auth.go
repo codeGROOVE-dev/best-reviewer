@@ -94,7 +94,7 @@ func newAppAuthClient(_ context.Context, appID, appKeyPath string, httpTimeout t
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate JWT: %w", err)
 	}
-	slog.Info("[AUTH] Successfully generated JWT for GitHub App")
+	slog.Info("Successfully generated JWT for GitHub App", "component", "auth")
 
 	// Create and configure client
 	return createAppAuthClient(creds.appID, creds.keyPath, creds.privateKeyContent, jwtToken, httpTimeout, cacheTTL), nil
@@ -116,7 +116,7 @@ func newPersonalTokenClient(ctx context.Context, token string, httpTimeout time.
 		return nil, err
 	}
 
-	slog.Info("[AUTH] Using personal access token authentication")
+	slog.Info("Using personal access token authentication", "component", "auth")
 
 	c := cache.New(cacheTTL)
 
@@ -145,12 +145,12 @@ func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
 
 	var privateKeyContent []byte
 	if appKeyPath != "" {
-		slog.Info("[AUTH] Using private key file path from command line: %s", appKeyPath)
+		slog.Info("Using private key file path from command line", "component", "auth", "path", appKeyPath)
 	} else {
 		// Check for private key content first (more secure)
 		if keyContent := os.Getenv("GITHUB_APP_KEY"); keyContent != "" {
 			privateKeyContent = []byte(keyContent)
-			slog.Info("[AUTH] Using GITHUB_APP_KEY environment variable (%d bytes)", len(privateKeyContent))
+			slog.Info("Using GITHUB_APP_KEY environment variable", "component", "auth", "bytes", len(privateKeyContent))
 			// Clear appKeyPath to ensure we don't try to read from file
 			appKeyPath = ""
 		} else {
@@ -161,7 +161,7 @@ func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
 				appKeyPath = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
 			}
 			if appKeyPath != "" {
-				slog.Info("[AUTH] Using private key file path: %s", appKeyPath)
+				slog.Info("Using private key file path", "component", "auth", "path", appKeyPath)
 			}
 		}
 	}
@@ -354,7 +354,7 @@ func (c *Client) refreshJWTIfNeeded() error {
 
 	c.token = newToken
 	c.tokenExpiry = time.Now().Add(9 * time.Minute)
-	slog.Info("[AUTH] Refreshed GitHub App JWT")
+	slog.Info("Refreshed GitHub App JWT", "component", "auth")
 
 	return nil
 }
@@ -397,12 +397,12 @@ func (c *Client) getInstallationToken(ctx context.Context, org string) (string, 
 	// Get installation ID for this org
 	installationID, ok := c.installationIDs[org]
 	if !ok {
-		slog.Info("[ERROR] No installation ID found for organization %s - app may not be installed", org)
+		slog.Error("No installation ID found for organization - app may not be installed", "component", "auth", "org", org)
 		return "", fmt.Errorf("no installation ID found for organization %s (is the app installed?)", org)
 	}
 
 	// Create installation access token
-	slog.Info("[AUTH] Creating installation access token for org %s (installation ID: %d)", org, installationID)
+	slog.Info("Creating installation access token for org", "component", "auth", "org", org, "installation_id", installationID)
 	apiURL := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
 
 	// Use JWT for this request
@@ -415,22 +415,22 @@ func (c *Client) getInstallationToken(ctx context.Context, org string) (string, 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		slog.Info("[ERROR] Failed to request installation token for org %s: %v", org, err)
+		slog.Error("Failed to request installation token for org", "component", "auth", "org", org, "error", err)
 		return "", fmt.Errorf("failed to get installation token: %w", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
 	if resp.StatusCode != http.StatusCreated {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			slog.Info("[ERROR] Failed to read error response body for org %s: %v", org, err)
+			slog.Error("Failed to read error response body for org", "component", "auth", "org", org, "error", err)
 			return "", fmt.Errorf("failed to create installation token (status %d) and read error: %w", resp.StatusCode, err)
 		}
-		slog.Info("[ERROR] GitHub API error creating installation token for org %s (status %d): %s", org, resp.StatusCode, string(body))
+		slog.Error("GitHub API error creating installation token for org", "component", "auth", "org", org, "status", resp.StatusCode, "body", string(body))
 		return "", fmt.Errorf("failed to create installation token (status %d): %s", resp.StatusCode, string(body))
 	}
 
@@ -439,12 +439,12 @@ func (c *Client) getInstallationToken(ctx context.Context, org string) (string, 
 		Token     string    `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		slog.Info("[ERROR] Failed to decode installation token response for org %s: %v", org, err)
+		slog.Error("Failed to decode installation token response for org", "component", "auth", "org", org, "error", err)
 		return "", fmt.Errorf("failed to decode token response: %w", err)
 	}
 
 	if tokenResp.Token == "" {
-		slog.Info("[ERROR] Received empty installation token for org %s", org)
+		slog.Error("Received empty installation token for org", "component", "auth", "org", org)
 		return "", errors.New("received empty installation token")
 	}
 
@@ -452,7 +452,7 @@ func (c *Client) getInstallationToken(ctx context.Context, org string) (string, 
 	c.installationTokens[org] = tokenResp.Token
 	c.installationExpiry[org] = tokenResp.ExpiresAt.Add(-5 * time.Minute)
 
-	slog.Info("[AUTH] Successfully created installation access token for org %s (expires at %s)", org, tokenResp.ExpiresAt.Format(time.RFC3339))
+	slog.Info("Successfully created installation access token for org", "component", "auth", "org", org, "expires_at", tokenResp.ExpiresAt.Format(time.RFC3339))
 	return tokenResp.Token, nil
 }
 
@@ -471,7 +471,7 @@ func (c *Client) ListAppInstallations(ctx context.Context) ([]string, error) {
 		return nil, errors.New("app installations can only be listed with GitHub App authentication")
 	}
 
-	slog.Info("[API] Fetching GitHub App installations")
+	slog.Info("Fetching GitHub App installations", "component", "api")
 	apiURL := "https://api.github.com/app/installations"
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -479,7 +479,7 @@ func (c *Client) ListAppInstallations(ctx context.Context) ([]string, error) {
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			slog.Info("[WARN] Failed to close response body: %v", err)
+			slog.Warn("Failed to close response body", "error", err)
 		}
 	}()
 
@@ -501,12 +501,12 @@ func (c *Client) ListAppInstallations(ctx context.Context) ([]string, error) {
 		c.installationTypes[installation.Account.Login] = installation.Account.Type
 
 		if installation.Account.Type == "Organization" {
-			slog.Info("[APP] Found installation in org: %s (ID: %d)", installation.Account.Login, installation.ID)
+			slog.Info("Found installation in org", "component", "app", "org", installation.Account.Login, "installation_id", installation.ID)
 		} else {
-			slog.Info("[APP] Found installation for user: %s (ID: %d)", installation.Account.Login, installation.ID)
+			slog.Info("Found installation for user", "component", "app", "user", installation.Account.Login, "installation_id", installation.ID)
 		}
 	}
 
-	slog.Info("[APP] Found %d installations (organizations and users)", len(orgs))
+	slog.Info("Found installations (organizations and users)", "component", "app", "count", len(orgs))
 	return orgs, nil
 }

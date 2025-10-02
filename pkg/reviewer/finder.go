@@ -43,22 +43,47 @@ func (f *Finder) Find(ctx context.Context, pr *types.PullRequest) ([]types.Revie
 		return nil, fmt.Errorf("pr cannot be nil")
 	}
 
-	slog.Info("🔍 Finding reviewers for PR #%d in %s/%s", pr.Number, pr.Owner, pr.Repository)
+	slog.Info("Finding reviewers for PR", "pr", pr.Number, "owner", pr.Owner, "repo", pr.Repository)
+
+	// Check if project has only 0-2 members with write access for early short-circuit
+	smallTeamMembers, totalMembers, err := f.checkSmallTeamProject(ctx, pr)
+	if err != nil {
+		slog.Warn("Failed to check small team project (continuing)", "error", err)
+	} else if totalMembers >= 0 && totalMembers <= 2 {
+		// Short-circuit for small teams (0-2 valid members excluding PR author)
+		if len(smallTeamMembers) == 0 {
+			slog.Info("Project has no valid reviewers (single-person project or PR author is only member)")
+			return nil, nil
+		} else if len(smallTeamMembers) == 1 {
+			slog.Info("Project has single member, assigning to them", "member", smallTeamMembers[0])
+		} else {
+			slog.Info("Project has 2 members, assigning both", "members", smallTeamMembers)
+		}
+		candidates := make([]types.ReviewerCandidate, len(smallTeamMembers))
+		for i, member := range smallTeamMembers {
+			candidates[i] = types.ReviewerCandidate{
+				Username:        member,
+				SelectionMethod: "small-team",
+				ContextScore:    maxContextScore,
+			}
+		}
+		return candidates, nil
+	}
 
 	// Use optimized method
 	candidates := f.findReviewersOptimized(ctx, pr)
 	if len(candidates) > 0 {
-		slog.Info("  ✅ Found %d candidates via optimized search", len(candidates))
+		slog.Info("Found candidates via optimized search", "count", len(candidates))
 		return candidates, nil
 	}
 
 	// Final fallback to original method
-	slog.Info("  ⚠️  Using fallback method")
+	slog.Warn("Using fallback method")
 	candidates = f.findReviewersFallback(ctx, pr)
 	if len(candidates) > 0 {
-		slog.Info("  ✅ Found %d candidates via fallback", len(candidates))
+		slog.Info("Found candidates via fallback", "count", len(candidates))
 	} else {
-		slog.Info("  ❌ No suitable reviewers found")
+		slog.Info("No suitable reviewers found")
 	}
 
 	return candidates, nil
@@ -71,7 +96,7 @@ func (f *Finder) findReviewersFallback(ctx context.Context, pr *types.PullReques
 	// Pre-fetch all PR file patches
 	patchCache, err := f.fetchAllPRFiles(ctx, pr.Owner, pr.Repository, pr.Number)
 	if err != nil {
-		slog.Info("[WARN] Failed to fetch PR file patches: %v (continuing without patches)", err)
+		slog.Warn("Failed to fetch PR file patches (continuing without patches)", "error", err)
 		patchCache = make(map[string]string) // Empty cache as fallback
 	}
 
@@ -134,7 +159,7 @@ func (f *Finder) findExpertAuthor(
 func (f *Finder) findAssigneeExpert(ctx context.Context, pr *types.PullRequest) string {
 	for _, assignee := range pr.Assignees {
 		if assignee == pr.Author {
-			slog.Info("    Filtered (is PR author): %s", assignee)
+			slog.Info("Filtered (is PR author)", "assignee", assignee)
 			continue
 		}
 		if f.isValidReviewer(ctx, pr, assignee) {
@@ -148,14 +173,14 @@ func (f *Finder) findAssigneeExpert(ctx context.Context, pr *types.PullRequest) 
 func (f *Finder) isValidReviewer(ctx context.Context, pr *types.PullRequest, username string) bool {
 	// Check if user is a bot
 	if f.client.IsUserBot(ctx, username) {
-		slog.Info("    Filtered (is bot): %s", username)
+		slog.Info("Filtered (is bot)", "username", username)
 		return false
 	}
 
 	// Check write access
 	hasAccess := f.client.HasWriteAccess(ctx, pr.Owner, pr.Repository, username)
 	if !hasAccess {
-		slog.Info("    Filtered (no write access): %s", username)
+		slog.Info("Filtered (no write access)", "username", username)
 		return false
 	}
 
@@ -163,10 +188,10 @@ func (f *Finder) isValidReviewer(ctx context.Context, pr *types.PullRequest, use
 	// This is a best-effort check - if it fails, we continue with the candidate
 	prCount, err := f.client.OpenPRCount(ctx, pr.Owner, username, f.prCountCache)
 	if err != nil {
-		slog.Info("    ⚠️  Warning: could not check PR count for %s in org %s: %v (continuing without PR count filter)", username, pr.Owner, err)
+		slog.Info("Warning: could not check PR count (continuing without PR count filter)", "username", username, "org", pr.Owner, "error", err)
 		// Continue without filtering - better to have a reviewer than none at all
 	} else if prCount > f.maxPRs {
-		slog.Info("    Filtered (too many open PRs %d > %d in org %s): %s", prCount, f.maxPRs, pr.Owner, username)
+		slog.Info("Filtered (too many open PRs)", "username", username, "pr_count", prCount, "max", f.maxPRs, "org", pr.Owner)
 		return false
 	}
 
@@ -239,7 +264,7 @@ func (f *Finder) fetchAllPRFiles(ctx context.Context, owner, repo string, prNumb
 		}
 	}
 
-	slog.Info("  [API] Fetching all file patches for PR #%d", prNumber)
+	slog.Info("Fetching all file patches for PR", "pr", prNumber)
 
 	// Fetch changed files
 	files, err := f.client.ChangedFiles(ctx, owner, repo, prNumber)
@@ -257,7 +282,64 @@ func (f *Finder) fetchAllPRFiles(ctx context.Context, owner, repo string, prNumb
 
 	// Cache the result
 	f.cache.SetWithTTL(cacheKey, patches, fileHistoryCacheTTL)
-	slog.Info("  ✅ Fetched and cached %d file patches", len(patches))
+	slog.Info("Fetched and cached file patches", "count", len(patches))
 
 	return patches, nil
+}
+
+// checkSmallTeamProject checks if the project has only 0-2 members with write access.
+// Returns (valid members, total count, error).
+// Valid members excludes the PR author and bots. Total count is the number of valid members.
+// Returns count=-1 if there are more than 2 valid members (no short-circuit needed).
+func (f *Finder) checkSmallTeamProject(ctx context.Context, pr *types.PullRequest) ([]string, int, error) {
+	type cachedResult struct {
+		Members []string
+		Count   int
+	}
+
+	cacheKey := makeCacheKey("small-team", pr.Owner, pr.Repository)
+	if cached, found := f.cache.Get(cacheKey); found {
+		if result, ok := cached.(cachedResult); ok {
+			slog.DebugContext(ctx, "Small team check cached", "count", result.Count)
+			return result.Members, result.Count, nil
+		}
+	}
+
+	slog.InfoContext(ctx, "Checking for small team project", "owner", pr.Owner, "repo", pr.Repository)
+
+	members, err := f.client.Collaborators(ctx, pr.Owner, pr.Repository)
+	if err != nil {
+		return nil, -1, fmt.Errorf("failed to fetch collaborators: %w", err)
+	}
+
+	var validMembers []string
+	for _, member := range members {
+		if member == pr.Author {
+			continue
+		}
+		if f.client.IsUserBot(ctx, member) {
+			continue
+		}
+		validMembers = append(validMembers, member)
+	}
+
+	slog.InfoContext(ctx, "Found project members", "total", len(members), "valid", len(validMembers), "pr_author", pr.Author)
+
+	count := len(validMembers)
+	var result []string
+
+	// Only cache small teams (0-2 members) for short-circuit optimization
+	if count <= 2 {
+		result = validMembers
+		if count > 0 {
+			slog.InfoContext(ctx, "Small team project detected", "member_count", count)
+		}
+	} else {
+		// More than 2 members - no short-circuit
+		count = -1
+	}
+
+	f.cache.SetWithTTL(cacheKey, cachedResult{Members: result, Count: count}, 6*time.Hour)
+
+	return result, count, nil
 }

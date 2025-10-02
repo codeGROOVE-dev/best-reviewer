@@ -46,3 +46,10 @@ type PRInfo struct {
 	Reviewers []string
 	Number    int
 }
+
+// UserActivity tracks a user's last activity in a repository.
+type UserActivity struct {
+	LastActivity time.Time
+	Username     string
+	Source       string // "commit", "pr_author", "pr_reviewer"
+}

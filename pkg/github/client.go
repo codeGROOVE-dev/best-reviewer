@@ -39,12 +39,12 @@ type Client struct {
 
 // Config holds configuration for creating a new GitHub client.
 type Config struct {
-	UseAppAuth  bool
+	HTTPTimeout time.Duration
+	CacheTTL    time.Duration
 	AppID       string
 	AppKeyPath  string
 	Token       string // Personal access token (for non-app auth)
-	HTTPTimeout time.Duration
-	CacheTTL    time.Duration
+	UseAppAuth  bool
 }
 
 // New creates a new GitHub API client using gh auth token or GitHub App authentication.
@@ -79,11 +79,17 @@ func (c *Client) getToken() string {
 // drainAndCloseBody drains and closes an HTTP response body to prevent resource leaks.
 func drainAndCloseBody(body io.ReadCloser) {
 	if _, err := io.Copy(io.Discard, body); err != nil {
-		slog.Info("[WARN] Failed to drain response body: %v", err)
+		slog.Warn("Failed to drain response body", "error", err)
 	}
 	if err := body.Close(); err != nil {
-		slog.Info("[WARN] Failed to close response body: %v", err)
+		slog.Warn("Failed to close response body", "error", err)
 	}
+}
+
+// MakeRequest makes an HTTP request to the GitHub API with retry logic.
+// This is exported to allow other packages to make authenticated GitHub API requests.
+func (c *Client) MakeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
+	return c.makeRequest(ctx, method, apiURL, body)
 }
 
 // makeRequest makes an HTTP request to the GitHub API with retry logic.
@@ -97,7 +103,7 @@ func (c *Client) makeRequest(ctx context.Context, method, apiURL string, body an
 
 	// Sanitize URL for logging - remove all sensitive query parameters
 	sanitizedURL := sanitizeURLForLogging(apiURL)
-	slog.Info("[HTTP] %s %s", method, sanitizedURL)
+	slog.Info("HTTP request", "component", "http", "method", method, "url", sanitizedURL)
 
 	var resp *http.Response
 	err := retryWithBackoff(ctx, fmt.Sprintf("%s %s", method, apiURL), func() error {
@@ -122,10 +128,10 @@ func (c *Client) makeRequest(ctx context.Context, method, apiURL string, body an
 			installToken, err := c.getInstallationToken(ctx, c.currentOrg)
 			if err == nil {
 				authToken = installToken
-				slog.Info("[DEBUG] Using installation token for org %s", c.currentOrg)
+				slog.Debug("Using installation token for org", "org", c.currentOrg)
 			} else {
 				// Graceful degradation: try with JWT token
-				slog.Info("[WARN] Failed to get installation token for %s, attempting with JWT (may have limited access): %v", c.currentOrg, err)
+				slog.Warn("Failed to get installation token, attempting with JWT (may have limited access)", "org", c.currentOrg, "error", err)
 			}
 		}
 
@@ -149,13 +155,13 @@ func (c *Client) makeRequest(ctx context.Context, method, apiURL string, body an
 		// Check for rate limiting or server errors that should trigger retry
 		if localResp.StatusCode == http.StatusTooManyRequests {
 			drainAndCloseBody(localResp.Body)
-			slog.Info("[WARN] Rate limited (429) on %s %s - will retry with backoff", method, sanitizedURL)
+			slog.Warn("Rate limited - will retry with backoff", "method", method, "url", sanitizedURL, "status", 429)
 			return fmt.Errorf("http %d: rate limited", localResp.StatusCode)
 		}
 
 		if localResp.StatusCode >= http.StatusInternalServerError && localResp.StatusCode < 600 {
 			drainAndCloseBody(localResp.Body)
-			slog.Info("[WARN] Server error (%d) on %s %s - will retry with backoff", localResp.StatusCode, method, sanitizedURL)
+			slog.Warn("Server error - will retry with backoff", "method", method, "url", sanitizedURL, "status", localResp.StatusCode)
 			return fmt.Errorf("http %d: server error", localResp.StatusCode)
 		}
 
@@ -168,7 +174,7 @@ func (c *Client) makeRequest(ctx context.Context, method, apiURL string, body an
 	}
 
 	// Log response status with sanitized URL
-	slog.Info("[HTTP] %s %s - Status: %d", method, sanitizedURL, resp.StatusCode)
+	slog.Info("HTTP response", "component", "http", "method", method, "url", sanitizedURL, "status", resp.StatusCode)
 	return resp, nil
 }
 
@@ -193,7 +199,7 @@ func retryWithBackoff(ctx context.Context, operation string, fn func() error) er
 		retry.DelayType(retry.BackOffDelay),
 		retry.MaxJitter(initialRetryDelay/4),
 		retry.OnRetry(func(n uint, err error) {
-			slog.Info("[RETRY] %s: attempt %d/%d failed: %v", operation, n+1, maxRetryAttempts, err)
+			slog.Info("Retry attempt", "component", "retry", "operation", operation, "attempt", n+1, "max_attempts", maxRetryAttempts, "error", err)
 		}),
 		retry.LastErrorOnly(true),
 		retry.RetryIf(func(err error) bool {
