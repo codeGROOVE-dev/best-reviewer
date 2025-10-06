@@ -1,3 +1,25 @@
+# Build configuration
+OUT_DIR := out
+BEST_REVIEWER_BIN := $(OUT_DIR)/best-reviewer
+BEST_REVIEWER_BOT_BIN := $(OUT_DIR)/best-reviewer-bot
+
+.PHONY: all
+all: build
+
+.PHONY: build
+build: $(BEST_REVIEWER_BIN) $(BEST_REVIEWER_BOT_BIN)
+
+$(BEST_REVIEWER_BIN):
+	mkdir -p $(OUT_DIR)
+	go build -o $@ ./cmd/best-reviewer
+
+$(BEST_REVIEWER_BOT_BIN):
+	mkdir -p $(OUT_DIR)
+	go build -o $@ ./cmd/best-reviewer-bot
+
+.PHONY: clean
+clean:
+	rm -rf $(OUT_DIR)
 
 # BEGIN: lint-install /Users/t/dev/r2r/github-smart-reviewer-bot/
 # http://github.com/codeGROOVE-dev/lint-install

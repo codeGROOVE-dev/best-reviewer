@@ -8,6 +8,11 @@
 *.so
 *.dylib
 
+# Project binaries (use 'make build' instead)
+/best-reviewer
+/best-reviewer-bot
+/better-reviewers
+
 # Test binary, built with `go test -c`
 *.test
 
