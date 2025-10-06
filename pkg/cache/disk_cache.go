@@ -90,27 +90,42 @@ func NewDiskCache(ttl time.Duration, cacheDir string) (*DiskCache, error) {
 	return dc, nil
 }
 
+// CacheHitType indicates where a cache value was found.
+type CacheHitType string
+
+const (
+	CacheHitMemory CacheHitType = "memory"
+	CacheHitDisk   CacheHitType = "disk"
+	CacheMiss      CacheHitType = "miss"
+)
+
 // Get retrieves a value from cache (memory first, then disk).
 func (c *DiskCache) Get(key string) (any, bool) {
+	value, hitType := c.GetWithHitType(key)
+	return value, hitType != CacheMiss
+}
+
+// GetWithHitType retrieves a value from cache and indicates where it was found.
+func (c *DiskCache) GetWithHitType(key string) (any, CacheHitType) {
 	// Try memory cache first
 	if value, found := c.Cache.Get(key); found {
-		return value, true
+		return value, CacheHitMemory
 	}
 
 	// Try disk cache if enabled
 	if !c.enabled {
-		return nil, false
+		return nil, CacheMiss
 	}
 
 	var entry diskEntry
 	if !c.loadFromDisk(key, &entry) {
-		return nil, false
+		return nil, CacheMiss
 	}
 
 	// Check expiration
 	if time.Now().After(entry.Expiration) {
 		c.removeFromDisk(key)
-		return nil, false
+		return nil, CacheMiss
 	}
 
 	// Unmarshal the value (it was stored as JSON)
@@ -118,7 +133,7 @@ func (c *DiskCache) Get(key string) (any, bool) {
 	if err := json.Unmarshal(entry.Value, &value); err != nil {
 		slog.Warn("Failed to unmarshal disk cache entry", "key", key, "error", err)
 		c.removeFromDisk(key)
-		return nil, false
+		return nil, CacheMiss
 	}
 
 	// Restore to memory cache
@@ -127,7 +142,7 @@ func (c *DiskCache) Get(key string) (any, bool) {
 		c.Cache.SetWithTTL(key, value, ttl)
 	}
 
-	return value, true
+	return value, CacheHitDisk
 }
 
 // SetWithTTL stores a value in both memory and disk cache.

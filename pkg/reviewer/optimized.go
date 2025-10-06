@@ -277,19 +277,13 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		slog.Info("Total candidates after all sources", "count", len(candidates))
 	}
 
-	// Filter and score candidates
+	// Filter candidates (bots, write access)
 	var validCandidates []candidateWeight
 	for _, c := range candidates {
-		// Apply hard filters (bots, write access)
 		if !f.isValidReviewer(ctx, pr, c.username) {
 			continue
 		}
-
-		// Calculate workload penalty
-		penalty := f.calculateWorkloadPenalty(ctx, pr, c.username)
-		c.workloadPenalty = penalty
-		c.finalScore = c.weight - penalty
-
+		c.finalScore = c.weight // Initial score without workload penalty
 		validCandidates = append(validCandidates, c)
 	}
 
@@ -298,7 +292,39 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		return nil
 	}
 
-	// Sort by final score (descending)
+	// Sort by expertise score (without workload) to identify top candidates
+	sort.Slice(validCandidates, func(i, j int) bool {
+		return validCandidates[i].weight > validCandidates[j].weight
+	})
+
+	// Only check workload for top 5 candidates (optimization to reduce API calls)
+	workloadCheckLimit := 5
+	if len(validCandidates) < workloadCheckLimit {
+		workloadCheckLimit = len(validCandidates)
+	}
+
+	// Batch fetch workload for top candidates
+	topUsernames := make([]string, workloadCheckLimit)
+	for i := 0; i < workloadCheckLimit; i++ {
+		topUsernames[i] = validCandidates[i].username
+	}
+
+	workloadCounts, err := f.client.BatchOpenPRCount(ctx, pr.Owner, topUsernames, f.prCountCache)
+	if err != nil {
+		slog.Warn("Failed to batch fetch workload, continuing without penalties", "error", err)
+		workloadCounts = make(map[string]int)
+	}
+
+	// Apply workload penalties to top candidates (10 points per PR)
+	for i := 0; i < workloadCheckLimit; i++ {
+		username := validCandidates[i].username
+		prCount := workloadCounts[username]
+		penalty := prCount * 10
+		validCandidates[i].workloadPenalty = penalty
+		validCandidates[i].finalScore = validCandidates[i].weight - penalty
+	}
+
+	// Re-sort by final score (with workload penalties applied to top 10)
 	sort.Slice(validCandidates, func(i, j int) bool {
 		return validCandidates[i].finalScore > validCandidates[j].finalScore
 	})

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codeGROOVE-dev/best-reviewer/pkg/cache"
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/types"
 )
 
@@ -159,43 +160,48 @@ func (c *Client) IsUserBot(_ context.Context, username string) bool {
 }
 
 // HasWriteAccess checks if a user has write access to the repository.
+// Uses the cached collaborators list. If we don't have permissions to fetch
+// the collaborators list (403), we fail-open and assume everyone has access.
 func (c *Client) HasWriteAccess(ctx context.Context, owner, repo, username string) bool {
-	// Check if user is a collaborator with write access
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators/%s", owner, repo, username)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
-	if err != nil {
-		slog.Warn("Failed to check write access for user", "username", username, "error", err)
-		return false // Fail closed - assume no access on error
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("Failed to close response body", "error", err)
+	// Try to use the collaborators list if we have it cached
+	collabCacheKey := makeCacheKey("collaborators", owner, repo)
+	collabPermCacheKey := makeCacheKey("collaborators-permission", owner, repo)
+
+	// Check if we cached a permission error (403)
+	if cached, found := c.cache.Get(collabPermCacheKey); found {
+		if noPermission, ok := cached.(bool); ok && noPermission {
+			// We don't have permission to check collaborators, assume everyone has access
+			return true
 		}
-	}()
-
-	// GitHub returns 204 No Content if user is a collaborator
-	// Returns 404 if not a collaborator
-	// Returns 403 if we don't have permission to check (treat as "unknown" - allow through)
-	if resp.StatusCode == http.StatusNoContent {
-		return true
 	}
 
-	if resp.StatusCode == http.StatusForbidden {
-		slog.Warn("Insufficient permissions to check write access, assuming access granted", "username", username, "owner", owner, "repo", repo)
-		return true // Graceful degradation - allow candidate through when we can't verify
+	// Check if we have the collaborators list cached
+	if cached, found := c.cache.Get(collabCacheKey); found {
+		if collabs, ok := cached.([]string); ok {
+			// Use the collaborators list for O(1) lookup
+			for _, collab := range collabs {
+				if collab == username {
+					return true
+				}
+			}
+			return false
+		}
 	}
 
-	// Only 404 (Not Found) definitively means no write access
-	return false
+	// No cached data available - this shouldn't happen if Collaborators() was called first
+	// Fail-open for safety
+	slog.Warn("No collaborators cache available, assuming write access", "username", username, "owner", owner, "repo", repo)
+	return true
 }
 
 // OpenPRCount returns the number of open PRs assigned to or requested for review by a user in an organization.
 func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL time.Duration) (int, error) {
 	// Check cache first for successful results
 	cacheKey := makeCacheKey("pr-count", org, user)
-	if cached, found := c.cache.Get(cacheKey); found {
+	cached, hitType := c.cache.GetWithHitType(cacheKey)
+	if hitType != cache.CacheMiss {
 		if count, ok := cached.(int); ok {
-			slog.Info("User has non-stale open PRs in org (cached)", "user", user, "count", count, "org", org)
+			slog.Info("User has non-stale open PRs in org", "user", user, "total", count, "org", org, "cache", hitType)
 			return count, nil
 		}
 	}
@@ -211,7 +217,7 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 		return 0, fmt.Errorf("invalid organization (%s) or user (%s)", org, user)
 	}
 
-	slog.Info("Fetching open PR count for user in org", "component", "api", "user", user, "org", org)
+	slog.Info("Fetching open PR count for user in org", "component", "api", "user", user, "org", org, "cache", "miss")
 
 	// Create a context with shorter timeout for PR count queries to avoid hanging
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -252,6 +258,100 @@ func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL tim
 	c.cache.SetWithTTL(cacheKey, total, cacheTTL)
 
 	return total, nil
+}
+
+// BatchOpenPRCount fetches PR counts for multiple users in a single GraphQL query.
+// Returns a map of username -> PR count. Uses cache for each user individually.
+func (c *Client) BatchOpenPRCount(ctx context.Context, org string, users []string, cacheTTL time.Duration) (map[string]int, error) {
+	if len(users) == 0 {
+		return make(map[string]int), nil
+	}
+
+	result := make(map[string]int)
+	var usersToFetch []string
+
+	// Check cache for each user first
+	for _, user := range users {
+		cacheKey := makeCacheKey("pr-count", org, user)
+		if cached, found := c.cache.Get(cacheKey); found {
+			if count, ok := cached.(int); ok {
+				result[user] = count
+				slog.Debug("Using cached PR count", "user", user, "count", count)
+				continue
+			}
+		}
+		usersToFetch = append(usersToFetch, user)
+	}
+
+	// If all were cached, return early
+	if len(usersToFetch) == 0 {
+		return result, nil
+	}
+
+	slog.Info("Batch fetching PR counts", "org", org, "users", len(usersToFetch))
+
+	// Calculate cutoff date for non-stale PRs
+	cutoffDate := time.Now().AddDate(0, 0, -prStaleDaysThreshold).Format("2006-01-02")
+
+	// Build GraphQL query with search for each user
+	queryParts := []string{"query {"}
+	for i, user := range usersToFetch {
+		// GraphQL field names can't have hyphens, use index
+		assignedQuery := fmt.Sprintf("is:pr is:open org:%s assignee:%s updated:>=%s", org, user, cutoffDate)
+		reviewQuery := fmt.Sprintf("is:pr is:open org:%s review-requested:%s updated:>=%s", org, user, cutoffDate)
+
+		queryParts = append(queryParts, fmt.Sprintf(`
+  assigned%d: search(query: "%s", type: ISSUE, first: 0) { issueCount }
+  review%d: search(query: "%s", type: ISSUE, first: 0) { issueCount }`,
+			i, assignedQuery, i, reviewQuery))
+	}
+	queryParts = append(queryParts, "}")
+
+	query := strings.Join(queryParts, "")
+
+	// Make GraphQL request
+	resp, err := c.MakeGraphQLRequest(ctx, query, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GraphQL batch workload query failed: %w", err)
+	}
+
+	// Parse response
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid GraphQL response structure")
+	}
+
+	// Extract counts for each user
+	for i, user := range usersToFetch {
+		assignedKey := fmt.Sprintf("assigned%d", i)
+		reviewKey := fmt.Sprintf("review%d", i)
+
+		assignedCount := 0
+		reviewCount := 0
+
+		if assignedData, ok := data[assignedKey].(map[string]any); ok {
+			if count, ok := assignedData["issueCount"].(float64); ok {
+				assignedCount = int(count)
+			}
+		}
+
+		if reviewData, ok := data[reviewKey].(map[string]any); ok {
+			if count, ok := reviewData["issueCount"].(float64); ok {
+				reviewCount = int(count)
+			}
+		}
+
+		total := assignedCount + reviewCount
+		result[user] = total
+
+		// Cache the result
+		cacheKey := makeCacheKey("pr-count", org, user)
+		c.cache.SetWithTTL(cacheKey, total, cacheTTL)
+
+		slog.Debug("Fetched PR count", "user", user, "total", total, "assigned", assignedCount, "review", reviewCount)
+	}
+
+	return result, nil
 }
 
 // searchPRCount searches for PRs matching a query and returns the count.
@@ -327,9 +427,10 @@ func (c *Client) cachePR(pr *types.PullRequest) {
 // This includes direct collaborators AND organization members with write access.
 func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]string, error) {
 	cacheKey := makeCacheKey("collaborators", owner, repo)
-	if cached, found := c.cache.Get(cacheKey); found {
+	cached, hitType := c.cache.GetWithHitType(cacheKey)
+	if hitType != cache.CacheMiss {
 		if collabs, ok := cached.([]string); ok {
-			slog.DebugContext(ctx, "Using cached collaborators", "owner", owner, "repo", repo)
+			slog.InfoContext(ctx, "Fetching collaborators", "owner", owner, "repo", repo, "cache", hitType, "count", len(collabs))
 			return collabs, nil
 		}
 	}
@@ -348,6 +449,11 @@ func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]strin
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		// If we got 403, cache this fact so HasWriteAccess knows to fail-open
+		if resp.StatusCode == http.StatusForbidden {
+			permCacheKey := makeCacheKey("collaborators-permission", owner, repo)
+			c.cache.SetWithTTL(permCacheKey, true, 6*time.Hour)
+		}
 		return nil, fmt.Errorf("failed to fetch collaborators (status %d)", resp.StatusCode)
 	}
 

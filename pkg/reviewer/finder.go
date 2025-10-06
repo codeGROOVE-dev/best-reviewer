@@ -106,9 +106,9 @@ func (f *Finder) calculateWorkloadPenalty(ctx context.Context, pr *types.PullReq
 		return 0 // No penalty for no open PRs
 	}
 
-	// Apply progressive penalty: 1 point per PR, so it slightly deprioritizes busy reviewers
+	// Apply progressive penalty: 10 points per PR to significantly deprioritize busy reviewers
 	// but never makes them ineligible. This is a soft signal, not a hard filter.
-	penalty := prCount
+	penalty := prCount * 10
 	slog.Debug("Workload penalty applied", "username", username, "pr_count", prCount, "penalty", penalty)
 	return penalty
 }
