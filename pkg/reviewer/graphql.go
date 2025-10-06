@@ -10,6 +10,250 @@ import (
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/types"
 )
 
+// blameForLines uses GitHub's blame API to find who last touched specific lines in a file.
+// Returns two lists: overlapping PRs (touched exact lines), and file PRs (touched file within last year).
+func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string, lineRanges [][2]int) ([]types.PRInfo, []types.PRInfo, error) {
+	slog.InfoContext(ctx, "Using blame API to find line authors", "file", filepath, "line_ranges", len(lineRanges))
+
+	if len(lineRanges) == 0 {
+		return nil, nil, nil
+	}
+
+	// GitHub blame API gives us commits - we need to map commits to PRs
+	query := `
+	query($owner: String!, $repo: String!, $path: String!) {
+		repository(owner: $owner, name: $repo) {
+			defaultBranchRef {
+				target {
+					... on Commit {
+						blame(path: $path) {
+							ranges {
+								startingLine
+								endingLine
+								commit {
+									oid
+									author {
+										user {
+											login
+										}
+									}
+									associatedPullRequests(first: 1) {
+										nodes {
+											number
+											merged
+											mergedAt
+											author {
+												login
+											}
+											mergedBy {
+												login
+											}
+											reviews(first: 10, states: APPROVED) {
+												nodes {
+													author {
+														login
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	variables := map[string]any{
+		"owner": owner,
+		"repo":  repo,
+		"path":  filepath,
+	}
+
+	result, err := f.client.MakeGraphQLRequest(ctx, query, variables)
+	if err != nil {
+		return nil, nil, fmt.Errorf("GraphQL blame request failed: %w", err)
+	}
+
+	// Check for GraphQL errors in response
+	if errors, ok := result["errors"]; ok {
+		slog.WarnContext(ctx, "GraphQL blame query returned errors", "errors", errors)
+	}
+
+	// Parse blame results - get both overlapping and all PRs
+	overlappingPRs, filePRs := f.parseBlameResults(result, lineRanges)
+	slog.InfoContext(ctx, "Blame API found PRs", "file", filepath, "overlapping_count", len(overlappingPRs), "file_contributors_count", len(filePRs))
+
+	return overlappingPRs, filePRs, nil
+}
+
+// parseBlameResults extracts PR info from blame GraphQL response for specific line ranges.
+// Returns two lists: PRs that overlap with changed lines, and all PRs in the file.
+func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) ([]types.PRInfo, []types.PRInfo) {
+	var overlappingPRs []types.PRInfo
+	var allPRs []types.PRInfo
+	seenOverlapping := make(map[int]bool)
+	seenAll := make(map[int]bool)
+
+	data, ok := mapValue(result, "data")
+	if !ok {
+		slog.Debug("No data field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	repository, ok := mapValue(data, "repository")
+	if !ok {
+		slog.Debug("No repository field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
+	if !ok {
+		slog.Debug("No defaultBranchRef field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	target, ok := mapValue(defaultBranchRef, "target")
+	if !ok {
+		slog.Debug("No target field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	blame, ok := mapValue(target, "blame")
+	if !ok {
+		slog.Debug("No blame field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	ranges, ok := blame["ranges"].([]any)
+	if !ok {
+		slog.Debug("No ranges field in blame response")
+		return overlappingPRs, allPRs
+	}
+
+	slog.Debug("Parsing blame ranges", "range_count", len(ranges), "looking_for_lines", lineRanges)
+	oneYearAgo := time.Now().AddDate(-1, 0, 0)
+
+	slog.Debug("Processing blame ranges", "total_ranges", len(ranges), "changed_line_ranges", lineRanges)
+	for _, r := range ranges {
+		rangeMap, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		startLine, _ := rangeMap["startingLine"].(float64)
+		endLine, _ := rangeMap["endingLine"].(float64)
+
+		// Check if this blame range overlaps with any of our changed line ranges
+		overlaps := false
+		for _, lineRange := range lineRanges {
+			if int(startLine) <= lineRange[1] && int(endLine) >= lineRange[0] {
+				overlaps = true
+				break
+			}
+		}
+
+		commit, ok := mapValue(rangeMap, "commit")
+		if !ok {
+			continue
+		}
+
+		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
+		if !ok {
+			continue
+		}
+
+		nodes, ok := associatedPRs["nodes"].([]any)
+		if !ok || len(nodes) == 0 {
+			continue
+		}
+
+		// Take the first associated PR
+		prNode, ok := nodes[0].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		prNumber, _ := prNode["number"].(float64)
+		merged, _ := prNode["merged"].(bool)
+		if !merged {
+			continue // Only consider merged PRs
+		}
+
+		// Extract mergedAt for recency check
+		var mergedAt time.Time
+		if mergedAtStr, ok := prNode["mergedAt"].(string); ok {
+			if t, err := time.Parse(time.RFC3339, mergedAtStr); err == nil {
+				mergedAt = t
+			}
+		}
+
+		// Build PR info
+		pr := types.PRInfo{
+			Number:    int(prNumber),
+			Merged:    merged,
+			MergedAt:  mergedAt,
+			LineCount: int(endLine) - int(startLine) + 1,
+		}
+
+		// Extract author
+		if author, ok := mapValue(prNode, "author"); ok {
+			if login, ok := author["login"].(string); ok {
+				pr.Author = login
+			}
+		}
+
+		// Extract mergedBy
+		if mergedBy, ok := mapValue(prNode, "mergedBy"); ok {
+			if login, ok := mergedBy["login"].(string); ok {
+				pr.MergedBy = login
+			}
+		}
+
+		// Extract reviewers
+		if reviews, ok := mapValue(prNode, "reviews"); ok {
+			if nodes, ok := reviews["nodes"].([]any); ok {
+				for _, node := range nodes {
+					if reviewNode, ok := node.(map[string]any); ok {
+						if author, ok := mapValue(reviewNode, "author"); ok {
+							if login, ok := author["login"].(string); ok {
+								pr.Reviewers = append(pr.Reviewers, login)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Add to appropriate list(s)
+		if overlaps {
+			// Overlapping lines - always include with full weight
+			if !seenOverlapping[int(prNumber)] {
+				seenOverlapping[int(prNumber)] = true
+				overlappingPRs = append(overlappingPRs, pr)
+				slog.Debug("Added overlapping PR", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "line_count", pr.LineCount)
+			}
+		} else {
+			// Non-overlapping - only include if within last year
+			if mergedAt.IsZero() {
+				slog.Debug("Skipping non-overlapping PR (no mergedAt)", "pr_number", int(prNumber), "author", pr.Author)
+			} else if !mergedAt.After(oneYearAgo) {
+				slog.Debug("Skipping non-overlapping PR (too old)", "pr_number", int(prNumber), "author", pr.Author, "merged_at", mergedAt)
+			} else {
+				if !seenAll[int(prNumber)] {
+					seenAll[int(prNumber)] = true
+					allPRs = append(allPRs, pr)
+					slog.Debug("Added non-overlapping file contributor", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "merged_at", mergedAt)
+				}
+			}
+		}
+	}
+
+	return overlappingPRs, allPRs
+}
+
 // recentPRsInDirectory finds recent PRs that modified files in a directory.
 func (f *Finder) recentPRsInDirectory(ctx context.Context, owner, repo, directory string) ([]types.PRInfo, error) {
 	slog.InfoContext(ctx, "Querying historical PRs in directory", "directory", directory, "owner", owner, "repo", repo)
@@ -87,10 +331,18 @@ func (f *Finder) recentPRsInProject(ctx context.Context, owner, repo string) ([]
 		slog.WarnContext(ctx, "Cache type assertion failed", "key", cacheKey)
 	}
 
-	query := `
+	// Fetch in two batches of 100 (GitHub's max) to get 200 total
+	var allPRs []types.PRInfo
+
+	// First batch
+	query1 := `
 	query($owner: String!, $repo: String!) {
 		repository(owner: $owner, name: $repo) {
-			pullRequests(first: 3, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+			pullRequests(first: 100, states: MERGED, orderBy: {field: CREATED_AT, direction: DESC}) {
+				pageInfo {
+					endCursor
+					hasNextPage
+				}
 				nodes {
 					number
 					merged
@@ -118,16 +370,95 @@ func (f *Finder) recentPRsInProject(ctx context.Context, owner, repo string) ([]
 		"repo":  repo,
 	}
 
-	result, err := f.client.MakeGraphQLRequest(ctx, query, variables)
+	result, err := f.client.MakeGraphQLRequest(ctx, query1, variables)
 	if err != nil {
 		return nil, fmt.Errorf("GraphQL request failed: %w", err)
 	}
 
 	prs, err := f.parseProjectPRsFromGraphQL(result)
-	if err == nil && len(prs) > 0 {
-		f.cache.Set(cacheKey, prs)
+	if err != nil {
+		return nil, err
 	}
-	return prs, err
+	allPRs = append(allPRs, prs...)
+
+	if len(prs) > 0 {
+		slog.InfoContext(ctx, "First batch PRs", "count", len(prs), "first_pr", prs[0].Number, "last_pr", prs[len(prs)-1].Number)
+	}
+
+	// Get cursor for second batch
+	data, ok := mapValue(result, "data")
+	if !ok {
+		return allPRs, nil
+	}
+	repository, ok := mapValue(data, "repository")
+	if !ok {
+		return allPRs, nil
+	}
+	pullRequests, ok := mapValue(repository, "pullRequests")
+	if !ok {
+		return allPRs, nil
+	}
+	pageInfo, ok := mapValue(pullRequests, "pageInfo")
+	if !ok {
+		return allPRs, nil
+	}
+	hasNextPage, _ := pageInfo["hasNextPage"].(bool)
+	if !hasNextPage {
+		slog.InfoContext(ctx, "Fetched all recent PRs", "count", len(allPRs))
+		f.cache.Set(cacheKey, allPRs)
+		return allPRs, nil
+	}
+
+	endCursor, ok := pageInfo["endCursor"].(string)
+	if !ok {
+		slog.InfoContext(ctx, "Fetched first batch of PRs", "count", len(allPRs))
+		f.cache.Set(cacheKey, allPRs)
+		return allPRs, nil
+	}
+
+	// Second batch
+	query2 := `
+	query($owner: String!, $repo: String!, $after: String!) {
+		repository(owner: $owner, name: $repo) {
+			pullRequests(first: 100, after: $after, states: MERGED, orderBy: {field: CREATED_AT, direction: DESC}) {
+				nodes {
+					number
+					merged
+					author {
+						login
+					}
+					mergedAt
+					mergedBy {
+						login
+					}
+					reviews(first: 10, states: APPROVED) {
+						nodes {
+							author {
+								login
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	variables["after"] = endCursor
+	result2, err := f.client.MakeGraphQLRequest(ctx, query2, variables)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to fetch second batch of PRs", "error", err)
+		f.cache.Set(cacheKey, allPRs)
+		return allPRs, nil
+	}
+
+	prs2, err := f.parseProjectPRsFromGraphQL(result2)
+	if err == nil {
+		allPRs = append(allPRs, prs2...)
+	}
+
+	slog.InfoContext(ctx, "Fetched recent PRs with pagination", "total_count", len(allPRs))
+	f.cache.Set(cacheKey, allPRs)
+	return allPRs, nil
 }
 
 // historicalPRsForFile finds merged PRs that modified a specific file.

@@ -68,42 +68,6 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 	candidates = append(candidates, fileCandidates...)
 
 	slog.Info("Found weighted candidates from file history", "count", len(fileCandidates), "total_with_assignees", len(candidates))
-
-	// Fetch recent 200 PRs to filter candidates by recent activity
-	recentPRs, err := f.recentPRsInProject(ctx, pr.Owner, pr.Repository)
-	if err != nil {
-		slog.Warn("Failed to fetch recent PRs for activity filtering", "error", err)
-		recentPRs = nil
-	}
-
-	// Build set of recent contributors and score based on activity (from last 200 PRs)
-	recentContributors := make(map[string]bool)
-	recentActivityScores := make(map[string]int)
-
-	for _, recentPR := range recentPRs {
-		if recentPR.Author != "" && !f.client.IsUserBot(ctx, recentPR.Author) {
-			recentContributors[recentPR.Author] = true
-			recentActivityScores[recentPR.Author] += 1 // +1 for authoring (unchanged - measures contribution)
-		}
-		if recentPR.MergedBy != "" && !f.client.IsUserBot(ctx, recentPR.MergedBy) {
-			recentContributors[recentPR.MergedBy] = true
-			recentActivityScores[recentPR.MergedBy] += 1 // +1 for merging (reduced from 3 to avoid overshadowing file expertise)
-		}
-		for _, reviewer := range recentPR.Reviewers {
-			if reviewer != "" && !f.client.IsUserBot(ctx, reviewer) {
-				recentContributors[reviewer] = true
-				recentActivityScores[reviewer] += 1 // +1 for reviewing (reduced from 2 to avoid overshadowing file expertise)
-			}
-		}
-	}
-
-	// Convert to sorted slice for logging
-	var contributorList []string
-	for username := range recentContributors {
-		contributorList = append(contributorList, username)
-	}
-	sort.Strings(contributorList)
-	slog.Info("Built recent contributors list", "count", len(recentContributors), "from_prs", len(recentPRs), "contributors", contributorList)
 	for i, c := range candidates {
 		if i < 10 { // Log first 10
 			var sourceList []string
@@ -114,61 +78,232 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		}
 	}
 
-	// Build candidate map for the next stages
-	candidateMap := make(map[string]*candidateWeight)
-	for i := range candidates {
-		candidateMap[candidates[i].username] = &candidates[i]
-	}
+	// Add line-overlap scoring (analyzes actual lines being modified)
+	patchCache, err := f.fetchAllPRFiles(ctx, pr.Owner, pr.Repository, pr.Number)
+	if err != nil {
+		slog.Warn("Failed to fetch PR patches for line overlap analysis", "error", err)
+	} else {
+		slog.Info("Analyzing line overlap with historical PRs")
+		overlaps := f.analyzeLineOverlaps(ctx, pr, topFiles, patchCache)
+		slog.Info("Line overlap analysis complete", "overlaps_found", len(overlaps))
 
-	// Add candidates from recent activity who didn't show up in blame
-	for username, activityScore := range recentActivityScores {
-		if _, exists := candidateMap[username]; !exists && activityScore > 0 {
-			slog.Info("Adding candidate from recent activity only", "username", username, "activity_score", activityScore)
-			candidateMap[username] = &candidateWeight{
-				username:     username,
-				weight:       activityScore,
-				sourceScores: map[string]int{"recent-activity": activityScore},
+		// Build candidate map from existing candidates
+		candidateMap := make(map[string]*candidateWeight)
+		for i := range candidates {
+			candidateMap[candidates[i].username] = &candidates[i]
+		}
+
+		// Add overlap scores based on actual line overlap count
+		for _, overlap := range overlaps {
+			// Use the actual overlap count (number of lines) as the score, not the weighted float
+			overlapScore := overlap.overlapCount
+			slog.Info("Processing overlap", "pr", overlap.prNumber, "author", overlap.author, "mergedBy", overlap.mergedBy, "reviewers", overlap.reviewers, "overlap_lines", overlapScore)
+			if overlapScore == 0 {
+				slog.Info("Skipping overlap with zero lines", "pr", overlap.prNumber)
+				continue
+			}
+
+			// Add author with full line-overlap score
+			if overlap.author != "" && overlap.author != pr.Author {
+				if existing, ok := candidateMap[overlap.author]; ok {
+					slog.Info("Boosting candidate from line overlap (author)", "username", overlap.author, "pr", overlap.prNumber, "boost", overlapScore)
+					existing.weight += overlapScore
+					existing.sourceScores["line-author"] += overlapScore
+				} else {
+					slog.Info("Adding candidate from line overlap (author)", "username", overlap.author, "pr", overlap.prNumber, "score", overlapScore)
+					candidateMap[overlap.author] = &candidateWeight{
+						username:     overlap.author,
+						weight:       overlapScore,
+						sourceScores: map[string]int{"line-author": overlapScore},
+					}
+				}
+			}
+
+			// Add reviewers with full line-overlap score
+			for _, reviewer := range overlap.reviewers {
+				if reviewer != "" && reviewer != pr.Author {
+					if existing, ok := candidateMap[reviewer]; ok {
+						slog.Info("Boosting candidate from line overlap (reviewer)", "username", reviewer, "pr", overlap.prNumber, "boost", overlapScore)
+						existing.weight += overlapScore
+						existing.sourceScores["line-reviewer"] += overlapScore
+					} else {
+						slog.Info("Adding candidate from line overlap (reviewer)", "username", reviewer, "pr", overlap.prNumber, "score", overlapScore)
+						candidateMap[reviewer] = &candidateWeight{
+							username:     reviewer,
+							weight:       overlapScore,
+							sourceScores: map[string]int{"line-reviewer": overlapScore},
+						}
+					}
+				}
+			}
+
+			// Add merger with smaller boost (30% of overlap, minimum 1 point if there's any overlap)
+			if overlap.mergedBy != "" && overlap.mergedBy != pr.Author {
+				// Use max(1, overlapScore*30%) to ensure at least 1 point for any overlap
+				mergerScore := (overlapScore * 3) / 10
+				if mergerScore == 0 && overlapScore > 0 {
+					mergerScore = 1 // Minimum 1 point for merging an overlapping PR
+				}
+				if existing, ok := candidateMap[overlap.mergedBy]; ok {
+					slog.Info("Boosting candidate from line overlap (merger)", "username", overlap.mergedBy, "pr", overlap.prNumber, "boost", mergerScore)
+					existing.weight += mergerScore
+					existing.sourceScores["line-merger"] += mergerScore
+				} else {
+					slog.Info("Adding candidate from line overlap (merger)", "username", overlap.mergedBy, "pr", overlap.prNumber, "score", mergerScore)
+					candidateMap[overlap.mergedBy] = &candidateWeight{
+						username:     overlap.mergedBy,
+						weight:       mergerScore,
+						sourceScores: map[string]int{"line-merger": mergerScore},
+					}
+				}
 			}
 		}
+
+		// Rebuild candidates from map
+		candidates = make([]candidateWeight, 0, len(candidateMap))
+		for _, c := range candidateMap {
+			candidates = append(candidates, *c)
+		}
+		slog.Info("Candidates after line overlap analysis", "count", len(candidates))
 	}
 
-	// Note: We don't need special handling for new files because the blame API
-	// already returns file-level contributors (within last year) for all files
+	// Add candidates from recent merged PRs (last 3 merged PRs in the repo)
+	recentPRs, err := f.recentPRsInProject(ctx, pr.Owner, pr.Repository)
+	if err != nil {
+		slog.Warn("Failed to fetch recent merged PRs", "error", err)
+	} else if len(recentPRs) == 0 {
+		slog.Info("No recent merged PRs found")
+	} else {
+		slog.Info("Found recent merged PRs", "count", len(recentPRs))
+		candidateMap := make(map[string]*candidateWeight)
+		// Build map from existing candidates
+		for i := range candidates {
+			candidateMap[candidates[i].username] = &candidates[i]
+		}
 
-	// Rebuild candidates slice from map
-	candidates = make([]candidateWeight, 0, len(candidateMap))
-	for _, c := range candidateMap {
-		candidates = append(candidates, *c)
+		// Add weight from recent merged PRs
+		for _, recentPR := range recentPRs {
+			// Add merger with high weight (strong signal)
+			if recentPR.MergedBy != "" && recentPR.MergedBy != pr.Author {
+				if existing, ok := candidateMap[recentPR.MergedBy]; ok {
+					slog.Info("Boosting existing candidate from merger", "username", recentPR.MergedBy, "pr", recentPR.Number, "boost", 50)
+					existing.weight += 50 // Boost existing candidates
+					existing.sourceScores["recent-merger"] += 50
+				} else {
+					slog.Info("Adding new candidate from merger", "username", recentPR.MergedBy, "pr", recentPR.Number, "weight", 50)
+					candidateMap[recentPR.MergedBy] = &candidateWeight{
+						username:     recentPR.MergedBy,
+						weight:       50,
+						sourceScores: map[string]int{"recent-merger": 50},
+					}
+				}
+			}
+
+			// Add reviewers with moderate weight
+			for _, reviewer := range recentPR.Reviewers {
+				if reviewer != "" && reviewer != pr.Author {
+					if existing, ok := candidateMap[reviewer]; ok {
+						slog.Info("Boosting existing candidate from reviewer", "username", reviewer, "pr", recentPR.Number, "boost", 25)
+						existing.weight += 25
+						existing.sourceScores["recent-reviewer"] += 25
+					} else {
+						slog.Info("Adding new candidate from reviewer", "username", reviewer, "pr", recentPR.Number, "weight", 25)
+						candidateMap[reviewer] = &candidateWeight{
+							username:     reviewer,
+							weight:       25,
+							sourceScores: map[string]int{"recent-reviewer": 25},
+						}
+					}
+				}
+			}
+		}
+
+		// Add candidates from directory activity using the recent PRs pool
+		// Deduplicate directories to avoid redundant processing
+		seenDirs := make(map[string]bool)
+		for _, file := range topFiles {
+			dir := filepath.Dir(file)
+			if seenDirs[dir] {
+				continue // Skip if we've already processed this directory
+			}
+			seenDirs[dir] = true
+
+			// Filter recent PRs to find those that touched this directory
+			var dirPRs []types.PRInfo
+			for _, recentPR := range recentPRs {
+				// Check if this PR touched any file in the directory
+				changedFiles, err := f.client.ChangedFiles(ctx, pr.Owner, pr.Repository, recentPR.Number)
+				if err != nil {
+					continue
+				}
+
+				// Check if any changed file is in this directory
+				for _, cf := range changedFiles {
+					if filepath.Dir(cf.Filename) == dir {
+						dirPRs = append(dirPRs, recentPR)
+						break
+					}
+				}
+
+				// Limit directory PRs
+				if len(dirPRs) >= 10 {
+					break
+				}
+			}
+
+			if len(dirPRs) > 0 {
+				slog.Info("Found directory activity", "directory", dir, "pr_count", len(dirPRs))
+				for _, dirPR := range dirPRs {
+					// Authors of recent directory changes get weight
+					if dirPR.Author != "" && dirPR.Author != pr.Author {
+						if existing, ok := candidateMap[dirPR.Author]; ok {
+							slog.Info("Boosting candidate from directory author", "username", dirPR.Author, "directory", dir, "boost", 30)
+							existing.weight += 30
+							existing.sourceScores["dir-author"] += 30
+						} else {
+							slog.Info("Adding candidate from directory author", "username", dirPR.Author, "directory", dir, "weight", 30)
+							candidateMap[dirPR.Author] = &candidateWeight{
+								username:     dirPR.Author,
+								weight:       30,
+								sourceScores: map[string]int{"dir-author": 30},
+							}
+						}
+					}
+					// Reviewers of recent directory changes
+					for _, reviewer := range dirPR.Reviewers {
+						if reviewer != "" && reviewer != pr.Author {
+							if existing, ok := candidateMap[reviewer]; ok {
+								slog.Info("Boosting candidate from directory reviewer", "username", reviewer, "directory", dir, "boost", 15)
+								existing.weight += 15
+								existing.sourceScores["dir-reviewer"] += 15
+							} else {
+								slog.Info("Adding candidate from directory reviewer", "username", reviewer, "directory", dir, "weight", 15)
+								candidateMap[reviewer] = &candidateWeight{
+									username:     reviewer,
+									weight:       15,
+									sourceScores: map[string]int{"dir-reviewer": 15},
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Rebuild candidates slice from map
+		candidates = make([]candidateWeight, 0, len(candidateMap))
+		for _, c := range candidateMap {
+			candidates = append(candidates, *c)
+		}
+		slog.Info("Total candidates after all sources", "count", len(candidates))
 	}
-	slog.Info("Total candidates after all sources", "count", len(candidates))
 
-	// Filter candidates (bots, write access, recent activity, PR author)
+	// Filter candidates (bots, write access)
 	var validCandidates []candidateWeight
 	for _, c := range candidates {
-		// Filter out PR author
-		if c.username == pr.Author {
-			slog.Info("Filtered out candidate", "username", c.username, "reason", "is PR author", "weight", c.weight)
-			continue
-		}
 		if !f.isValidReviewer(ctx, pr, c.username) {
-			slog.Info("Filtered out candidate", "username", c.username, "reason", "failed validation")
 			continue
 		}
-		// Filter by recent activity (must be in last 200 PRs)
-		if len(recentContributors) > 0 && !recentContributors[c.username] {
-			slog.Info("Filtered out candidate", "username", c.username, "reason", "not in recent 200 PRs")
-			continue
-		}
-
-		// Add recent activity score if not already added
-		if activityScore := recentActivityScores[c.username]; activityScore > 0 {
-			if _, hasActivity := c.sourceScores["recent-activity"]; !hasActivity {
-				c.weight += activityScore
-				c.sourceScores["recent-activity"] = activityScore
-				slog.Info("Added recent activity score", "username", c.username, "activity_score", activityScore, "new_weight", c.weight)
-			}
-		}
-
 		c.finalScore = c.weight // Initial score without workload penalty
 		validCandidates = append(validCandidates, c)
 	}
@@ -178,20 +313,10 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		return nil
 	}
 
-	slog.Info("Valid candidates after filtering", "count", len(validCandidates))
-
 	// Sort by expertise score (without workload) to identify top candidates
 	sort.Slice(validCandidates, func(i, j int) bool {
 		return validCandidates[i].weight > validCandidates[j].weight
 	})
-
-	// Log top candidates before workload check
-	for i, c := range validCandidates {
-		if i >= 10 {
-			break
-		}
-		slog.Info("Valid candidate before workload", "rank", i+1, "username", c.username, "weight", c.weight)
-	}
 
 	// Only check workload for top 5 candidates (optimization to reduce API calls)
 	workloadCheckLimit := 5
@@ -211,23 +336,13 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		workloadCounts = make(map[string]int)
 	}
 
-	// Apply workload penalties to top candidates (10 points per PR, capped at 50% of score)
+	// Apply workload penalties to top candidates (10 points per PR)
 	for i := 0; i < workloadCheckLimit; i++ {
 		username := validCandidates[i].username
 		prCount := workloadCounts[username]
-		rawPenalty := prCount * 10
-
-		// Cap penalty at 50% of expertise score to avoid driving highly contexted people negative
-		maxPenalty := validCandidates[i].weight / 2
-		penalty := rawPenalty
-		if penalty > maxPenalty {
-			penalty = maxPenalty
-			slog.Info("Capped workload penalty", "username", username, "pr_count", prCount, "raw_penalty", rawPenalty, "capped_penalty", penalty, "weight", validCandidates[i].weight)
-		}
-
+		penalty := prCount * 10
 		validCandidates[i].workloadPenalty = penalty
 		validCandidates[i].finalScore = validCandidates[i].weight - penalty
-		slog.Info("Applied workload penalty", "username", username, "pr_count", prCount, "penalty", penalty, "weight", validCandidates[i].weight, "final_score", validCandidates[i].finalScore)
 	}
 
 	// Re-sort by final score (with workload penalties applied to top 10)
@@ -324,7 +439,6 @@ func (f *Finder) topChangedFilesFiltered(pr *types.PullRequest, n int) []string 
 }
 
 // collectWeightedCandidates collects candidates using GitHub blame API to find line-level experts.
-// collectWeightedCandidates collects candidates using GitHub blame API to find line-level experts.
 func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRequest, files []string) []candidateWeight {
 	candidateMap := make(map[string]*candidateWeight)
 
@@ -344,21 +458,26 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 
 		slog.Info("Analyzing changed lines with blame", "file", file, "line_ranges", len(changedLines))
 
-		// Use blame to find PRs that touched these lines (overlapping) and file (non-overlapping)
-		overlappingPRs, filePRs, err := f.blameForLines(ctx, pr.Owner, pr.Repository, file, changedLines)
+		// Use blame to find PRs that touched these lines
+		blamePRs, err := f.blameForLines(ctx, pr.Owner, pr.Repository, file, changedLines)
 		if err != nil {
 			slog.Warn("Failed to get blame", "file", file, "error", err)
 			continue
 		}
 
-		// Score candidates from overlapping blame results (full weight)
-		for _, blamePR := range overlappingPRs {
-			lineCount := blamePR.LineCount
-			if lineCount == 0 {
-				lineCount = 1
+		// Score candidates from blame results
+		for _, blamePR := range blamePRs {
+			// Skip if it's the current PR author
+			if blamePR.Author == pr.Author {
+				continue
 			}
 
-			// Full weight for overlapping lines
+			lineCount := blamePR.LineCount
+			if lineCount == 0 {
+				lineCount = 1 // Minimum weight
+			}
+
+			// Add weight for the author
 			if blamePR.Author != "" && !f.client.IsUserBot(ctx, blamePR.Author) {
 				if existing, ok := candidateMap[blamePR.Author]; ok {
 					existing.weight += lineCount
@@ -372,8 +491,9 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 				}
 			}
 
-			if blamePR.MergedBy != "" && !f.client.IsUserBot(ctx, blamePR.MergedBy) {
-				mergeWeight := lineCount * 2
+			// Add weight for who merged the PR (strong signal of active maintainer)
+			if blamePR.MergedBy != "" && blamePR.MergedBy != pr.Author && !f.client.IsUserBot(ctx, blamePR.MergedBy) {
+				mergeWeight := lineCount * 2 // Double weight for mergers
 				if existing, ok := candidateMap[blamePR.MergedBy]; ok {
 					existing.weight += mergeWeight
 					existing.sourceScores["blame-merger"] += mergeWeight
@@ -386,8 +506,9 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 				}
 			}
 
+			// Add weight for reviewers
 			for _, reviewer := range blamePR.Reviewers {
-				if reviewer != "" && !f.client.IsUserBot(ctx, reviewer) {
+				if reviewer != "" && reviewer != pr.Author && !f.client.IsUserBot(ctx, reviewer) {
 					if existing, ok := candidateMap[reviewer]; ok {
 						existing.weight += lineCount
 						existing.sourceScores["blame-reviewer"] += lineCount
@@ -401,49 +522,137 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 				}
 			}
 		}
+	}
 
-		// Score candidates from file-level contributions (lower weight - recent file editors)
-		for _, filePR := range filePRs {
-			// Give +5 points for recently touching the file (even if not exact lines)
-			fileWeight := 5
+	// OLD APPROACH REMOVED - now using blame API instead of fetching 200 PRs
+	_ = candidateMap
 
-			if filePR.Author != "" && !f.client.IsUserBot(ctx, filePR.Author) {
-				if existing, ok := candidateMap[filePR.Author]; ok {
-					existing.weight += fileWeight
-					existing.sourceScores["file-author"] += fileWeight
+	// First fetch the recent 200 merged PRs to use as the pool
+	recentPRs, err := f.recentPRsInProject(ctx, pr.Owner, pr.Repository)
+	if err != nil {
+		slog.Warn("Failed to fetch recent PRs pool", "error", err)
+		return nil
+	}
+
+	// Log active contributors from the recent PRs pool (excluding bots)
+	activeContributors := make(map[string]int) // username -> PR count
+	for _, recentPR := range recentPRs {
+		if recentPR.Author != "" && !f.client.IsUserBot(ctx, recentPR.Author) {
+			activeContributors[recentPR.Author]++
+		}
+		if recentPR.MergedBy != "" && !f.client.IsUserBot(ctx, recentPR.MergedBy) {
+			activeContributors[recentPR.MergedBy]++
+		}
+		for _, reviewer := range recentPR.Reviewers {
+			if reviewer != "" && !f.client.IsUserBot(ctx, reviewer) {
+				activeContributors[reviewer]++
+			}
+		}
+	}
+
+	// Sort by PR count and log
+	type contributor struct {
+		username string
+		prCount  int
+	}
+	var sortedContributors []contributor
+	for username, count := range activeContributors {
+		sortedContributors = append(sortedContributors, contributor{username, count})
+	}
+	sort.Slice(sortedContributors, func(i, j int) bool {
+		return sortedContributors[i].prCount > sortedContributors[j].prCount
+	})
+
+	var activeNames []string
+	for _, c := range sortedContributors {
+		activeNames = append(activeNames, fmt.Sprintf("%s(%d)", c.username, c.prCount))
+	}
+
+	slog.Info("Active contributors from recent PRs pool", "pool_size", len(recentPRs), "unique_contributors", len(activeContributors), "contributors", strings.Join(activeNames, ", "))
+
+	for _, file := range files {
+		// Filter recent PRs to find those that touched this file
+		var historicalPRs []types.PRInfo
+		for _, recentPR := range recentPRs {
+			// Check if this PR touched the file by fetching its changed files
+			changedFiles, err := f.client.ChangedFiles(ctx, pr.Owner, pr.Repository, recentPR.Number)
+			if err != nil {
+				continue
+			}
+
+			// Check if any changed file matches our target file
+			for _, cf := range changedFiles {
+				if cf.Filename == file {
+					historicalPRs = append(historicalPRs, recentPR)
+					break
+				}
+			}
+
+			// Limit to maxHistoricalPRs per file
+			if len(historicalPRs) >= maxHistoricalPRs {
+				break
+			}
+		}
+
+		slog.Info("Found recent PRs for file", "file", file, "count", len(historicalPRs))
+
+		for _, histPR := range historicalPRs {
+			// Skip if it's the current PR
+			if histPR.Number == pr.Number {
+				continue
+			}
+
+			// Get the patch for this historical PR to count lines
+			patch, err := f.client.FilePatch(ctx, pr.Owner, pr.Repository, histPR.Number, file)
+			if err != nil {
+				continue
+			}
+
+			lineCount := f.countLinesInPatch(patch)
+			if lineCount == 0 {
+				continue
+			}
+
+			// Add weight for the author
+			if histPR.Author != "" && histPR.Author != pr.Author {
+				if existing, ok := candidateMap[histPR.Author]; ok {
+					existing.weight += lineCount
+					existing.sourceScores["file-author"] += lineCount
 				} else {
-					candidateMap[filePR.Author] = &candidateWeight{
-						username:     filePR.Author,
-						weight:       fileWeight,
-						sourceScores: map[string]int{"file-author": fileWeight},
+					candidateMap[histPR.Author] = &candidateWeight{
+						username:     histPR.Author,
+						weight:       lineCount,
+						sourceScores: map[string]int{"file-author": lineCount},
 					}
 				}
 			}
 
-			if filePR.MergedBy != "" && !f.client.IsUserBot(ctx, filePR.MergedBy) {
-				mergeWeight := fileWeight * 2
-				if existing, ok := candidateMap[filePR.MergedBy]; ok {
+			// Add weight for who merged the PR (strong signal of active maintainer)
+			if histPR.MergedBy != "" && histPR.MergedBy != pr.Author {
+				mergeWeight := lineCount * 2 // Double weight for mergers as it's a strong activity signal
+				if existing, ok := candidateMap[histPR.MergedBy]; ok {
 					existing.weight += mergeWeight
 					existing.sourceScores["file-merger"] += mergeWeight
 				} else {
-					candidateMap[filePR.MergedBy] = &candidateWeight{
-						username:     filePR.MergedBy,
+					candidateMap[histPR.MergedBy] = &candidateWeight{
+						username:     histPR.MergedBy,
 						weight:       mergeWeight,
 						sourceScores: map[string]int{"file-merger": mergeWeight},
 					}
 				}
 			}
 
-			for _, reviewer := range filePR.Reviewers {
-				if reviewer != "" && !f.client.IsUserBot(ctx, reviewer) {
+			// Add weight for reviewers
+			for _, reviewer := range histPR.Reviewers {
+				if reviewer != "" && reviewer != pr.Author {
 					if existing, ok := candidateMap[reviewer]; ok {
-						existing.weight += fileWeight
-						existing.sourceScores["file-reviewer"] += fileWeight
+						existing.weight += lineCount
+						existing.sourceScores["file-reviewer"] += lineCount
 					} else {
 						candidateMap[reviewer] = &candidateWeight{
 							username:     reviewer,
-							weight:       fileWeight,
-							sourceScores: map[string]int{"file-reviewer": fileWeight},
+							weight:       lineCount,
+							sourceScores: map[string]int{"file-reviewer": lineCount},
 						}
 					}
 				}

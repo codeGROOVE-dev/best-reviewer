@@ -114,16 +114,22 @@ func (c *DiskCache) GetWithHitType(key string) (any, CacheHitType) {
 
 	// Try disk cache if enabled
 	if !c.enabled {
+		slog.Debug("Disk cache disabled, returning miss", "key", key)
 		return nil, CacheMiss
 	}
 
+	cacheFile := filepath.Join(c.cacheDir, c.cacheKey(key)+".json")
+	slog.Debug("Checking disk cache", "key", key, "file", cacheFile)
+
 	var entry diskEntry
 	if !c.loadFromDisk(key, &entry) {
+		slog.Debug("Disk cache file not found or unreadable", "key", key)
 		return nil, CacheMiss
 	}
 
 	// Check expiration
 	if time.Now().After(entry.Expiration) {
+		slog.Debug("Disk cache entry expired", "key", key, "expired_at", entry.Expiration)
 		c.removeFromDisk(key)
 		return nil, CacheMiss
 	}
@@ -135,6 +141,8 @@ func (c *DiskCache) GetWithHitType(key string) (any, CacheHitType) {
 		c.removeFromDisk(key)
 		return nil, CacheMiss
 	}
+
+	slog.Debug("Disk cache hit", "key", key, "cached_at", entry.CachedAt, "ttl_remaining", time.Until(entry.Expiration))
 
 	// Restore to memory cache
 	ttl := time.Until(entry.Expiration)
@@ -152,8 +160,11 @@ func (c *DiskCache) SetWithTTL(key string, value any, ttl time.Duration) {
 
 	// Store on disk if enabled
 	if !c.enabled {
+		slog.Debug("Disk cache disabled, skipping disk write", "key", key)
 		return
 	}
+
+	slog.Debug("Writing to disk cache", "key", key, "ttl", ttl, "cache_dir", c.cacheDir)
 
 	// Marshal value to JSON for disk storage
 	valueJSON, err := json.Marshal(value)
@@ -170,6 +181,9 @@ func (c *DiskCache) SetWithTTL(key string, value any, ttl time.Duration) {
 
 	if err := c.saveToDisk(key, entry); err != nil {
 		slog.Debug("Failed to save to disk cache", "key", key, "error", err)
+	} else {
+		cacheFile := filepath.Join(c.cacheDir, c.cacheKey(key)+".json")
+		slog.Debug("Disk cache write successful", "key", key, "file", cacheFile)
 	}
 }
 

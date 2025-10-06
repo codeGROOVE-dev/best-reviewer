@@ -24,6 +24,7 @@ type PullRequest struct {
 // ChangedFile represents a file changed in a pull request.
 type ChangedFile struct {
 	Filename  string
+	Status    string // "added", "modified", "removed", "renamed"
 	Patch     string
 	Additions int
 	Deletions int
@@ -46,6 +47,8 @@ type PRInfo struct {
 	MergedBy  string
 	Reviewers []string
 	Number    int
+	Merged    bool
+	LineCount int // Number of lines this PR touched (for blame-based weighting)
 }
 
 // UserActivity tracks a user's last activity in a repository.

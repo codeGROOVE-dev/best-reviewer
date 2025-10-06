@@ -16,12 +16,17 @@ import (
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/reviewer"
 )
 
-var (
-	verbose      = flag.Bool("v", false, "Verbose output with detailed diagnostics")
-	maxPRs       = flag.Int("max-prs", 9, "Maximum number of non-stale open PRs a candidate can have")
-	prCountCache = flag.Duration("pr-count-cache", 6*time.Hour, "Cache duration for PR count queries")
-	cacheDir     = flag.String("cache-dir", "", "Directory for disk cache (empty = memory-only, e.g., /tmp/reviewer-cache)")
-)
+var verbose = flag.Bool("v", false, "Verbose output with detailed diagnostics")
+
+const prCountCache = 6 * time.Hour
+
+func defaultCacheDir() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return dir + "/best-reviewer"
+}
 
 func main() {
 	flag.Usage = func() {
@@ -73,15 +78,12 @@ func main() {
 	}
 
 	// Create GitHub client
-	if *cacheDir != "" {
-		slog.Info("Cache directory configured", "cache_dir", *cacheDir)
-	}
 	cfg := github.Config{
 		UseAppAuth:  false,
 		Token:       token,
 		HTTPTimeout: 30 * time.Second,
 		CacheTTL:    24 * time.Hour,
-		CacheDir:    *cacheDir,
+		CacheDir:    defaultCacheDir(),
 	}
 	client, err := github.New(ctx, cfg)
 	if err != nil {
@@ -91,8 +93,7 @@ func main() {
 
 	// Create reviewer finder
 	finderCfg := reviewer.Config{
-		MaxPRs:       *maxPRs,
-		PRCountCache: *prCountCache,
+		PRCountCache: prCountCache,
 	}
 	finder := reviewer.New(client, finderCfg)
 

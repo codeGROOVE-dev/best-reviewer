@@ -16,13 +16,11 @@ import (
 type Finder struct {
 	client       *github.Client
 	cache        *cache.Cache
-	maxPRs       int
 	prCountCache time.Duration
 }
 
 // Config holds configuration for the reviewer finder.
 type Config struct {
-	MaxPRs       int           // Maximum open PRs per reviewer
 	PRCountCache time.Duration // Cache duration for PR counts
 }
 
@@ -31,7 +29,6 @@ func New(client *github.Client, cfg Config) *Finder {
 	return &Finder{
 		client:       client,
 		cache:        cache.New(cacheTTL),
-		maxPRs:       cfg.MaxPRs,
 		prCountCache: cfg.PRCountCache,
 	}
 }

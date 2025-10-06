@@ -231,6 +231,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 
 	var files []struct {
 		Filename  string `json:"filename"`
+		Status    string `json:"status"`
 		Patch     string `json:"patch"`
 		Additions int    `json:"additions"`
 		Deletions int    `json:"deletions"`
@@ -244,6 +245,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 	for _, f := range files {
 		changedFiles = append(changedFiles, types.ChangedFile{
 			Filename:  f.Filename,
+			Status:    f.Status,
 			Additions: f.Additions,
 			Deletions: f.Deletions,
 			Patch:     f.Patch,

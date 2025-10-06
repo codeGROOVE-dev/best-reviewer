@@ -24,12 +24,12 @@ var (
 	appKeyPath = flag.String("app-key-path", "", "Path to GitHub App private key file")
 
 	// Behavior flags.
-	serve        = flag.Bool("serve", false, "Run in server mode with health endpoint")
-	loopDelay    = flag.Duration("loop-delay", 5*time.Minute, "Loop delay in serve mode (default: 5m)")
-	dryRun       = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
-	minOpenTime  = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
-	maxOpenTime  = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
-	maxPRs       = flag.Int("max-prs", 9, "Maximum number of non-stale open PRs a candidate can have")
+	serve       = flag.Bool("serve", false, "Run in server mode with health endpoint")
+	loopDelay   = flag.Duration("loop-delay", 5*time.Minute, "Loop delay in serve mode (default: 5m)")
+	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
+	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
+	maxOpenTime = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
+
 	prCountCache = flag.Duration("pr-count-cache", 6*time.Hour, "Cache duration for PR count queries")
 )
 
@@ -109,7 +109,6 @@ func main() {
 
 	// Create reviewer finder
 	finderCfg := reviewer.Config{
-		MaxPRs:       *maxPRs,
 		PRCountCache: *prCountCache,
 	}
 	finder := reviewer.New(client, finderCfg)
