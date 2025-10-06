@@ -43,6 +43,7 @@ type ReviewerCandidate struct {
 type PRInfo struct {
 	MergedAt  time.Time
 	Author    string
+	MergedBy  string
 	Reviewers []string
 	Number    int
 }

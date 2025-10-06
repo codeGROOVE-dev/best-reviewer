@@ -70,106 +70,13 @@ func (f *Finder) Find(ctx context.Context, pr *types.PullRequest) ([]types.Revie
 		return candidates, nil
 	}
 
-	// Use optimized method
+	// Find reviewers using scoring algorithm
 	candidates := f.findReviewersOptimized(ctx, pr)
-	if len(candidates) > 0 {
-		slog.Info("Found candidates via optimized search", "count", len(candidates))
-		return candidates, nil
-	}
-
-	// Final fallback to original method
-	slog.Warn("Using fallback method")
-	candidates = f.findReviewersFallback(ctx, pr)
-	if len(candidates) > 0 {
-		slog.Info("Found candidates via fallback", "count", len(candidates))
-	} else {
-		slog.Info("No suitable reviewers found")
-	}
-
+	slog.Info("Reviewer search complete", "count", len(candidates))
 	return candidates, nil
 }
 
-// findReviewersFallback is the original reviewer finding logic as a fallback.
-func (f *Finder) findReviewersFallback(ctx context.Context, pr *types.PullRequest) []types.ReviewerCandidate {
-	files := f.changedFiles(pr)
-
-	// Pre-fetch all PR file patches
-	patchCache, err := f.fetchAllPRFiles(ctx, pr.Owner, pr.Repository, pr.Number)
-	if err != nil {
-		slog.Warn("Failed to fetch PR file patches (continuing without patches)", "error", err)
-		patchCache = make(map[string]string) // Empty cache as fallback
-	}
-
-	// Find expert author (code ownership context)
-	author, authorMethod := f.findExpertAuthor(ctx, pr, files, patchCache)
-
-	// Find expert reviewer (review activity context)
-	reviewer, reviewerMethod := f.findExpertReviewer(ctx, pr, files, patchCache, author)
-
-	// Build final candidate list
-	var candidates []types.ReviewerCandidate
-
-	if author != "" && author != pr.Author {
-		candidates = append(candidates, types.ReviewerCandidate{
-			Username:        author,
-			SelectionMethod: authorMethod,
-			ContextScore:    maxContextScore,
-		})
-	}
-
-	if reviewer != "" && reviewer != pr.Author && reviewer != author {
-		candidates = append(candidates, types.ReviewerCandidate{
-			Username:        reviewer,
-			SelectionMethod: reviewerMethod,
-			ContextScore:    maxContextScore / 2,
-		})
-	}
-
-	return candidates
-}
-
-// findExpertAuthor finds the most relevant code author for the changes.
-func (f *Finder) findExpertAuthor(
-	ctx context.Context, pr *types.PullRequest, files []string, patchCache map[string]string,
-) (author string, method string) {
-	// Check assignees first
-	if assignee := f.findAssigneeExpert(ctx, pr); assignee != "" {
-		return assignee, SelectionAssignee
-	}
-
-	// Check line overlap
-	if author := f.findOverlappingAuthor(ctx, pr, files, patchCache); author != "" {
-		return author, SelectionAuthorOverlap
-	}
-
-	// Check directory authors
-	if author := f.findDirectoryAuthor(ctx, pr, files); author != "" {
-		return author, SelectionAuthorDirectory
-	}
-
-	// Check project authors
-	if author := f.findProjectAuthor(ctx, pr); author != "" {
-		return author, SelectionAuthorProject
-	}
-
-	return "", ""
-}
-
-// findAssigneeExpert checks if any PR assignees can be expert authors.
-func (f *Finder) findAssigneeExpert(ctx context.Context, pr *types.PullRequest) string {
-	for _, assignee := range pr.Assignees {
-		if assignee == pr.Author {
-			slog.Info("Filtered (is PR author)", "assignee", assignee)
-			continue
-		}
-		if f.isValidReviewer(ctx, pr, assignee) {
-			return assignee
-		}
-	}
-	return ""
-}
-
-// isValidReviewer checks if a user is a valid reviewer.
+// isValidReviewer checks if a user is a valid reviewer (only hard filters).
 func (f *Finder) isValidReviewer(ctx context.Context, pr *types.PullRequest, username string) bool {
 	// Check if user is a bot
 	if f.client.IsUserBot(ctx, username) {
@@ -177,47 +84,33 @@ func (f *Finder) isValidReviewer(ctx context.Context, pr *types.PullRequest, use
 		return false
 	}
 
-	// Check write access
+	// Check write access - this is the only hard filter since they can't approve without it
 	hasAccess := f.client.HasWriteAccess(ctx, pr.Owner, pr.Repository, username)
 	if !hasAccess {
 		slog.Info("Filtered (no write access)", "username", username)
 		return false
 	}
 
-	// Check PR count for workload balancing across the organization
-	// This is a best-effort check - if it fails, we continue with the candidate
-	prCount, err := f.client.OpenPRCount(ctx, pr.Owner, username, f.prCountCache)
-	if err != nil {
-		slog.Info("Warning: could not check PR count (continuing without PR count filter)", "username", username, "org", pr.Owner, "error", err)
-		// Continue without filtering - better to have a reviewer than none at all
-	} else if prCount > f.maxPRs {
-		slog.Info("Filtered (too many open PRs)", "username", username, "pr_count", prCount, "max", f.maxPRs, "org", pr.Owner)
-		return false
-	}
-
 	return true
 }
 
-// findExpertReviewer finds the most active reviewer for the changes.
-func (f *Finder) findExpertReviewer(
-	ctx context.Context, pr *types.PullRequest, files []string, patchCache map[string]string, excludeAuthor string,
-) (reviewer string, method string) {
-	// Check line overlap
-	if reviewer := f.findOverlappingReviewer(ctx, pr, files, patchCache, excludeAuthor); reviewer != "" {
-		return reviewer, SelectionReviewerOverlap
+// calculateWorkloadPenalty returns a score penalty based on PR count (not a hard filter).
+func (f *Finder) calculateWorkloadPenalty(ctx context.Context, pr *types.PullRequest, username string) int {
+	prCount, err := f.client.OpenPRCount(ctx, pr.Owner, username, f.prCountCache)
+	if err != nil {
+		slog.Debug("Could not check PR count, no penalty applied", "username", username, "org", pr.Owner, "error", err)
+		return 0 // No penalty if we can't check
 	}
 
-	// Check directory reviewers
-	if reviewer := f.findDirectoryReviewer(ctx, pr, files, excludeAuthor); reviewer != "" {
-		return reviewer, SelectionReviewerDirectory
+	if prCount == 0 {
+		return 0 // No penalty for no open PRs
 	}
 
-	// Check project reviewers
-	if reviewer := f.findProjectReviewer(ctx, pr, excludeAuthor); reviewer != "" {
-		return reviewer, SelectionReviewerProject
-	}
-
-	return "", ""
+	// Apply progressive penalty: 1 point per PR, so it slightly deprioritizes busy reviewers
+	// but never makes them ineligible. This is a soft signal, not a hard filter.
+	penalty := prCount
+	slog.Debug("Workload penalty applied", "username", username, "pr_count", prCount, "penalty", penalty)
+	return penalty
 }
 
 // changedFiles returns the list of changed files, limiting to the most changed.

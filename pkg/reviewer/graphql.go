@@ -93,10 +93,14 @@ func (f *Finder) recentPRsInProject(ctx context.Context, owner, repo string) ([]
 			pullRequests(first: 3, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
 				nodes {
 					number
+					merged
 					author {
 						login
 					}
 					mergedAt
+					mergedBy {
+						login
+					}
 					reviews(first: 10, states: APPROVED) {
 						nodes {
 							author {
@@ -162,6 +166,9 @@ func (f *Finder) historicalPRsForFile(ctx context.Context, owner, repo, filepath
 											login
 										}
 										mergedAt
+										mergedBy {
+											login
+										}
 										reviews(first: 5, states: APPROVED) {
 											nodes {
 												author {
@@ -461,7 +468,17 @@ func parsePRNode(pr map[string]any) *types.PRInfo {
 		}
 	}
 
+	if mergedBy, ok := mapValue(pr, "mergedBy"); ok {
+		if login, ok := stringValue(mergedBy, "login"); ok {
+			prInfo.MergedBy = login
+		}
+	} else {
+		slog.Debug("No mergedBy found in PR node", "pr", prInfo.Number, "raw_mergedBy", pr["mergedBy"])
+	}
+
 	prInfo.Reviewers = extractReviewers(pr)
+
+	slog.Debug("Parsed PR node", "pr", prInfo.Number, "author", prInfo.Author, "mergedBy", prInfo.MergedBy, "reviewers", prInfo.Reviewers)
 
 	return prInfo
 }

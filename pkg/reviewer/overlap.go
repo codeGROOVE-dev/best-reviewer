@@ -15,70 +15,11 @@ import (
 type lineOverlap struct {
 	mergedAt     time.Time
 	author       string
+	mergedBy     string
 	reviewers    []string
 	overlapScore float64
 	prNumber     int
 	overlapCount int
-}
-
-// findOverlappingAuthor finds authors of PRs with highest line overlap.
-func (f *Finder) findOverlappingAuthor(ctx context.Context, pr *types.PullRequest, files []string, patchCache map[string]string) string {
-	slog.Info("Analyzing line overlap for authors")
-	overlaps := f.analyzeLineOverlaps(ctx, pr, files, patchCache)
-
-	sa := make(scoreAggregator)
-	for _, overlap := range overlaps {
-		if overlap.author == pr.Author {
-			slog.Info("Filtered (is PR author)", "author", overlap.author)
-			continue
-		}
-		if f.isValidReviewer(ctx, pr, overlap.author) {
-			if overlap.author != "" && overlap.overlapScore > 0 {
-				slog.Info("Overlap candidate", "author", overlap.author, "score", overlap.overlapScore, "lines", overlap.overlapCount, "pr", overlap.prNumber)
-				sa[overlap.author] += overlap.overlapScore
-			}
-		}
-	}
-
-	author := sa.best()
-	if author != "" {
-		slog.Info("Best overlap author", "author", author, "total_score", sa[author])
-	}
-	return author
-}
-
-// findOverlappingReviewer finds reviewers of PRs with highest line overlap.
-func (f *Finder) findOverlappingReviewer(
-	ctx context.Context, pr *types.PullRequest, files []string, patchCache map[string]string, excludeAuthor string,
-) string {
-	slog.Info("Analyzing line overlap for reviewers")
-	overlaps := f.analyzeLineOverlaps(ctx, pr, files, patchCache)
-
-	sa := make(scoreAggregator)
-	for _, overlap := range overlaps {
-		for _, reviewer := range overlap.reviewers {
-			if reviewer == pr.Author {
-				slog.Info("Filtered (is PR author)", "reviewer", reviewer)
-				continue
-			}
-			if reviewer == excludeAuthor {
-				slog.Info("Filtered (is excluded author)", "reviewer", reviewer)
-				continue
-			}
-			if f.isValidReviewer(ctx, pr, reviewer) {
-				if reviewer != "" && overlap.overlapScore > 0 {
-					slog.Info("Overlap candidate", "reviewer", reviewer, "score", overlap.overlapScore, "lines", overlap.overlapCount, "pr", overlap.prNumber)
-					sa[reviewer] += overlap.overlapScore
-				}
-			}
-		}
-	}
-
-	reviewer := sa.best()
-	if reviewer != "" {
-		slog.Info("Best overlap reviewer", "reviewer", reviewer, "total_score", sa[reviewer])
-	}
-	return reviewer
 }
 
 // analyzeLineOverlaps finds historical PRs that modified the same lines.
@@ -224,6 +165,7 @@ func (f *Finder) calculatePROverlap(
 	return &lineOverlap{
 		prNumber:     histPR.Number,
 		author:       histPR.Author,
+		mergedBy:     histPR.MergedBy,
 		reviewers:    histPR.Reviewers,
 		mergedAt:     histPR.MergedAt,
 		overlapCount: totalOverlap,
