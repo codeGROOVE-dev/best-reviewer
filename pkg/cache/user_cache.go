@@ -103,6 +103,9 @@ func IsLikelyBot(username string) bool {
 		"release-drafter",
 		"probot",
 		"octokitbot",
+		"circleci",
+		"travis",
+		"jenkins",
 	}
 
 	for _, bot := range knownBots {

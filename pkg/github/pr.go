@@ -209,7 +209,7 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber int) ([]types.ChangedFile, error) {
 	// Check cache first
 	cacheKey := fmt.Sprintf("pr-files:%s/%s:%d", owner, repo, prNumber)
-	cached, hitType := c.cache.GetWithHitType(cacheKey)
+	cached, hitType := c.cache.Lookup(cacheKey)
 	if hitType != cache.CacheMiss {
 		if files, ok := cached.([]types.ChangedFile); ok {
 			slog.Info("Fetching changed files for PR to determine modified files for reviewer expertise matching", "component", "api", "owner", owner, "repo", repo, "pr", prNumber, "cache", hitType)

@@ -157,8 +157,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	fmt.Printf("🏆 Top %d Reviewer Recommendations (in descending order):\n\n", min(5, len(candidates)))
-	for i, candidate := range candidates[:min(5, len(candidates))] {
+	topCount := min(5, len(candidates))
+	fmt.Printf("🏆 Top %d Reviewer Recommendations (in descending order):\n\n", topCount)
+	for i, candidate := range candidates[:topCount] {
 		fmt.Printf("%d. @%s\n", i+1, candidate.Username)
 		fmt.Printf("   Selection Method: %s\n", candidate.SelectionMethod)
 		fmt.Printf("   Context Score: %d\n", candidate.ContextScore)
@@ -222,11 +223,4 @@ func getGitHubToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to get GitHub token: %w", err)
 	}
 	return strings.TrimSpace(string(output)), nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

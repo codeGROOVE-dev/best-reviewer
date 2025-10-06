@@ -370,7 +370,7 @@ func (b *Bot) startHealthServer() {
 	}
 
 	http.HandleFunc("/_-_/health", func(w http.ResponseWriter, _ *http.Request) {
-		stats := b.metrics.GetStats()
+		stats := b.metrics.Stats()
 
 		status := "ok"
 		statusCode := http.StatusOK
@@ -401,7 +401,9 @@ func (b *Bot) startHealthServer() {
 
 		b.metrics.isPolling = true
 
-		go func(ctx context.Context) {
+		// Start background polling with a detached context since HTTP request will complete
+		go func() {
+			ctx := context.Background()
 			defer func() {
 				b.metrics.isPolling = false
 				b.metrics.pollingMu.Unlock()
@@ -416,7 +418,7 @@ func (b *Bot) startHealthServer() {
 				b.metrics.RecordRunComplete()
 				slog.Info("Manual poll completed", "duration", time.Since(startTime))
 			}
-		}(context.Background())
+		}()
 
 		w.WriteHeader(http.StatusAccepted)
 		if _, err := w.Write([]byte("Poll triggered\n")); err != nil {
@@ -493,8 +495,8 @@ type Stats struct {
 	PRsModified int
 }
 
-// GetStats returns the current statistics.
-func (m *MetricsCollector) GetStats() Stats {
+// Stats returns the current statistics.
+func (m *MetricsCollector) Stats() Stats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return Stats{

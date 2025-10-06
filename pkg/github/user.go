@@ -198,7 +198,7 @@ func (c *Client) HasWriteAccess(ctx context.Context, owner, repo, username strin
 func (c *Client) OpenPRCount(ctx context.Context, org, user string, cacheTTL time.Duration) (int, error) {
 	// Check cache first for successful results
 	cacheKey := makeCacheKey("pr-count", org, user)
-	cached, hitType := c.cache.GetWithHitType(cacheKey)
+	cached, hitType := c.cache.Lookup(cacheKey)
 	if hitType != cache.CacheMiss {
 		if count, ok := cached.(int); ok {
 			slog.Info("User has non-stale open PRs in org", "user", user, "total", count, "org", org, "cache", hitType)
@@ -427,7 +427,7 @@ func (c *Client) cachePR(pr *types.PullRequest) {
 // This includes direct collaborators AND organization members with write access.
 func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]string, error) {
 	cacheKey := makeCacheKey("collaborators", owner, repo)
-	cached, hitType := c.cache.GetWithHitType(cacheKey)
+	cached, hitType := c.cache.Lookup(cacheKey)
 	if hitType != cache.CacheMiss {
 		if collabs, ok := cached.([]string); ok {
 			slog.InfoContext(ctx, "Fetching collaborators", "owner", owner, "repo", repo, "cache", hitType, "count", len(collabs))

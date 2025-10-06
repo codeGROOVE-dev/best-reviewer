@@ -101,12 +101,12 @@ const (
 
 // Get retrieves a value from cache (memory first, then disk).
 func (c *DiskCache) Get(key string) (any, bool) {
-	value, hitType := c.GetWithHitType(key)
+	value, hitType := c.Lookup(key)
 	return value, hitType != CacheMiss
 }
 
-// GetWithHitType retrieves a value from cache and indicates where it was found.
-func (c *DiskCache) GetWithHitType(key string) (any, CacheHitType) {
+// Lookup retrieves a value from cache and indicates where it was found.
+func (c *DiskCache) Lookup(key string) (any, CacheHitType) {
 	// Try memory cache first
 	if value, found := c.Cache.Get(key); found {
 		return value, CacheHitMemory
@@ -204,7 +204,11 @@ func (c *DiskCache) loadFromDisk(key string, v any) bool {
 		}
 		return false
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Debug("Failed to close disk cache file", "error", err, "path", path)
+		}
+	}()
 
 	if err := json.NewDecoder(file).Decode(v); err != nil {
 		slog.Debug("Failed to decode disk cache file", "error", err, "path", path)
@@ -227,18 +231,18 @@ func (c *DiskCache) saveToDisk(key string, v any) error {
 
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(v); err != nil {
-		file.Close()
-		os.Remove(tmpPath)
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("encoding cache data: %w", err)
 	}
 
 	if err := file.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("closing cache file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("renaming cache file: %w", err)
 	}
 
