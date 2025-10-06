@@ -374,9 +374,9 @@ func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]strin
 }
 
 // sanitizeURLForLogging removes sensitive query parameters from URLs.
+// Since GitHub API uses Authorization header (not query params) for tokens,
+// we only need to redact actual token/secret parameters if they exist.
 func sanitizeURLForLogging(apiURL string) string {
-	if idx := strings.Index(apiURL, "?"); idx != -1 {
-		return apiURL[:idx] + "?[REDACTED]"
-	}
+	// GitHub API uses header-based auth, so query params are safe to log
 	return apiURL
 }

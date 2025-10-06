@@ -206,6 +206,14 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 
 // ChangedFiles fetches the list of changed files in a PR.
 func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber int) ([]types.ChangedFile, error) {
+	// Check cache first
+	cacheKey := fmt.Sprintf("pr-files:%s/%s:%d", owner, repo, prNumber)
+	if cached, found := c.cache.Get(cacheKey); found {
+		if files, ok := cached.([]types.ChangedFile); ok {
+			return files, nil
+		}
+	}
+
 	slog.Info("Fetching changed files for PR to determine modified files for reviewer expertise matching", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
 	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
@@ -238,6 +246,13 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 			Patch:     f.Patch,
 		})
 	}
+
+	// Cache the result
+	// TODO: Use different TTLs based on PR state:
+	// - Current PR being examined: Don't cache (or very short TTL like 1 minute)
+	// - Historical merged PR: 28 days (immutable)
+	// For now, using 6 hours as compromise
+	c.cache.SetWithTTL(cacheKey, changedFiles, 6*time.Hour)
 
 	return changedFiles, nil
 }

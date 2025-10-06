@@ -22,7 +22,7 @@ import (
 type Client struct {
 	tokenExpiry        time.Time
 	installationTokens map[string]string
-	cache              *cache.Cache
+	cache              *cache.DiskCache
 	httpClient         *http.Client
 	installationExpiry map[string]time.Time
 	installationIDs    map[string]int
@@ -41,6 +41,7 @@ type Client struct {
 type Config struct {
 	HTTPTimeout time.Duration
 	CacheTTL    time.Duration
+	CacheDir    string // Directory for disk cache (empty = memory-only)
 	AppID       string
 	AppKeyPath  string
 	Token       string // Personal access token (for non-app auth)
@@ -50,9 +51,9 @@ type Config struct {
 // New creates a new GitHub API client using gh auth token or GitHub App authentication.
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.UseAppAuth {
-		return newAppAuthClient(ctx, cfg.AppID, cfg.AppKeyPath, cfg.HTTPTimeout, cfg.CacheTTL)
+		return newAppAuthClient(ctx, cfg.AppID, cfg.AppKeyPath, cfg.HTTPTimeout, cfg.CacheTTL, cfg.CacheDir)
 	}
-	return newPersonalTokenClient(ctx, cfg.Token, cfg.HTTPTimeout, cfg.CacheTTL)
+	return newPersonalTokenClient(ctx, cfg.Token, cfg.HTTPTimeout, cfg.CacheTTL, cfg.CacheDir)
 }
 
 // SetCurrentOrg sets the current organization being processed.

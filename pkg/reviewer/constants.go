@@ -22,17 +22,26 @@ const (
 
 // Configuration constants.
 const (
-	nearbyLines       = 3                   // lines within this distance count as "nearby"
-	maxFilesToAnalyze = 3                   // Focus on 3 files with largest delta to reduce API calls
-	maxHistoricalPRs  = 2                   // Limit to 2 PRs per file to reduce API calls
-	cacheTTL          = 24 * time.Hour      // Default cache TTL for most items
-	prCacheTTL        = 20 * 24 * time.Hour // Cache PRs for 20 days (use updated_at to invalidate)
+	nearbyLines       = 3              // lines within this distance count as "nearby"
+	maxFilesToAnalyze = 3              // Focus on 3 files with largest delta to reduce API calls
+	maxHistoricalPRs  = 2              // Limit to 2 PRs per file to reduce API calls
+	cacheTTL          = 24 * time.Hour // Default cache TTL for in-memory cache
 
-	// Specific cache TTLs for different data types.
-	repoContributorsCacheTTL = 4 * time.Hour      // 4 hours - catch people returning from vacation
-	directoryOwnersCacheTTL  = 3 * 24 * time.Hour // Directory ownership changes slowly
-	fileHistoryCacheTTL      = 3 * 24 * time.Hour // File history changes slowly
-	prCountCacheTTL          = 6 * time.Hour      // PR count for workload balancing (default).
+	// Cache TTLs for different data types
+	// NOTE: Use cache.TTL* constants from pkg/cache for disk cache
+	//
+	// Current PR (being examined): NEVER cache - fetch fresh
+	// User workload (PR counts): cache.TTLWorkload (2 hours) - changes frequently
+	// Historical PRs (for overlap): cache.TTLHistoricalPR (28 days) - immutable once merged
+	// Recent activity: cache.TTLRecentActivity (4 hours) - changes daily
+	// File history: cache.TTLFileHistory (3 days) - changes slowly
+	// Collaborators: cache.TTLCollaborators (6 hours) - changes occasionally
+
+	prCacheTTL               = 20 * 24 * time.Hour // Legacy - prefer cache.TTLHistoricalPR for merged PRs
+	repoContributorsCacheTTL = 4 * time.Hour       // Recent activity - prefer cache.TTLRecentActivity
+	directoryOwnersCacheTTL  = 3 * 24 * time.Hour  // File history - prefer cache.TTLFileHistory
+	fileHistoryCacheTTL      = 3 * 24 * time.Hour  // File history - prefer cache.TTLFileHistory
+	prCountCacheTTL          = 6 * time.Hour       // Workload - prefer cache.TTLWorkload (2h for freshness)
 
 	// API and pagination limits.
 	perPageLimit = 100 // GitHub API per_page limit

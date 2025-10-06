@@ -71,7 +71,7 @@ func generateJWT(appID string, privateKey []byte) (string, error) {
 }
 
 // newAppAuthClient creates a GitHub client with App authentication.
-func newAppAuthClient(_ context.Context, appID, appKeyPath string, httpTimeout time.Duration, cacheTTL time.Duration) (*Client, error) {
+func newAppAuthClient(_ context.Context, appID, appKeyPath string, httpTimeout time.Duration, cacheTTL time.Duration, cacheDir string) (*Client, error) {
 	// Resolve credentials from flags or environment variables
 	creds, err := resolveAppCredentials(appID, appKeyPath)
 	if err != nil {
@@ -97,11 +97,11 @@ func newAppAuthClient(_ context.Context, appID, appKeyPath string, httpTimeout t
 	slog.Info("Successfully generated JWT for GitHub App", "component", "auth")
 
 	// Create and configure client
-	return createAppAuthClient(creds.appID, creds.keyPath, creds.privateKeyContent, jwtToken, httpTimeout, cacheTTL), nil
+	return createAppAuthClient(creds.appID, creds.keyPath, creds.privateKeyContent, jwtToken, httpTimeout, cacheTTL, cacheDir), nil
 }
 
 // newPersonalTokenClient creates a GitHub client with personal token authentication.
-func newPersonalTokenClient(ctx context.Context, token string, httpTimeout time.Duration, cacheTTL time.Duration) (*Client, error) {
+func newPersonalTokenClient(ctx context.Context, token string, httpTimeout time.Duration, cacheTTL time.Duration, cacheDir string) (*Client, error) {
 	// If no token provided, get it from gh CLI
 	if token == "" {
 		cmd := exec.CommandContext(ctx, "gh", "auth", "token")
@@ -118,7 +118,17 @@ func newPersonalTokenClient(ctx context.Context, token string, httpTimeout time.
 
 	slog.Info("Using personal access token authentication", "component", "auth")
 
-	c := cache.New(cacheTTL)
+	// Create disk cache if cacheDir is provided, otherwise fallback to memory-only
+	if cacheDir != "" {
+		slog.Info("Attempting to create disk cache", "cache_dir", cacheDir)
+	}
+	c, err := cache.NewDiskCache(cacheTTL, cacheDir)
+	if err != nil {
+		slog.Warn("Failed to create disk cache, using memory-only", "error", err)
+		c = &cache.DiskCache{Cache: cache.New(cacheTTL)}
+	} else if cacheDir != "" {
+		slog.Info("Successfully created disk cache", "cache_dir", cacheDir)
+	}
 
 	return &Client{
 		httpClient: &http.Client{Timeout: httpTimeout},
@@ -281,8 +291,16 @@ func validateToken(token string) error {
 }
 
 // createAppAuthClient creates a configured GitHub App authentication client.
-func createAppAuthClient(appID, keyPath string, privateKeyContent []byte, jwtToken string, httpTimeout time.Duration, cacheTTL time.Duration) *Client {
-	c := cache.New(cacheTTL)
+func createAppAuthClient(appID, keyPath string, privateKeyContent []byte, jwtToken string, httpTimeout time.Duration, cacheTTL time.Duration, cacheDir string) *Client {
+	// Create disk cache if cacheDir is provided, otherwise fallback to memory-only
+	c, err := cache.NewDiskCache(cacheTTL, cacheDir)
+	if err != nil {
+		slog.Warn("Failed to create disk cache, using memory-only", "error", err)
+		c = &cache.DiskCache{Cache: cache.New(cacheTTL)}
+	}
+	if cacheDir != "" {
+		slog.Info("Using disk cache", "cache_dir", cacheDir)
+	}
 
 	client := &Client{
 		httpClient:         &http.Client{Timeout: httpTimeout},

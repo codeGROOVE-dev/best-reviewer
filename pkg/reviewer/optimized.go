@@ -219,8 +219,15 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 		}
 
 		// Add candidates from directory activity (recent commits to directories)
+		// Deduplicate directories to avoid redundant queries
+		seenDirs := make(map[string]bool)
 		for _, file := range topFiles {
 			dir := filepath.Dir(file)
+			if seenDirs[dir] {
+				continue // Skip if we've already processed this directory
+			}
+			seenDirs[dir] = true
+
 			// Get recent PRs in this directory
 			dirPRs, err := f.recentPRsInDirectory(ctx, pr.Owner, pr.Repository, dir)
 			if err == nil && len(dirPRs) > 0 {
