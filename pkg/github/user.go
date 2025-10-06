@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,19 +60,19 @@ func (uc *UserCache) Set(username string, info *UserInfo) {
 }
 
 // CacheUserTypeFromGraphQL caches user type information from GraphQL responses.
-func (c *Client) CacheUserTypeFromGraphQL(username, typeName string) {
+func (c *Client) CacheUserTypeFromGraphQL(ctx context.Context, username, typeName string) {
 	if c.userCache == nil || username == "" {
 		return
 	}
 
-	isBot := false
+	var isBot bool
 	switch typeName {
 	case "Bot":
 		isBot = true
 	case "Organization":
 		isBot = false
 	default:
-		isBot = c.IsUserBot(context.Background(), username)
+		isBot = c.IsUserBot(ctx, username)
 	}
 
 	info := &UserInfo{
@@ -82,7 +83,7 @@ func (c *Client) CacheUserTypeFromGraphQL(username, typeName string) {
 }
 
 // IsUserBot checks if a user is a bot.
-func (c *Client) IsUserBot(_ context.Context, username string) bool {
+func (*Client) IsUserBot(_ context.Context, username string) bool {
 	lower := strings.ToLower(username)
 
 	// Check for common bot patterns
@@ -395,7 +396,7 @@ func makeCacheKey(parts ...string) string {
 
 // cachedPR retrieves a PR from cache if valid.
 func (c *Client) cachedPR(owner, repo string, prNumber int, expectedUpdatedAt *time.Time) (*types.PullRequest, bool) {
-	cacheKey := makeCacheKey("pr", owner, repo, fmt.Sprintf("%d", prNumber))
+	cacheKey := makeCacheKey("pr", owner, repo, strconv.Itoa(prNumber))
 	cached, found := c.cache.Get(cacheKey)
 	if !found {
 		return nil, false
@@ -418,7 +419,7 @@ func (c *Client) cachedPR(owner, repo string, prNumber int, expectedUpdatedAt *t
 
 // cachePR stores a PR in cache.
 func (c *Client) cachePR(pr *types.PullRequest) {
-	cacheKey := makeCacheKey("pr", pr.Owner, pr.Repository, fmt.Sprintf("%d", pr.Number))
+	cacheKey := makeCacheKey("pr", pr.Owner, pr.Repository, strconv.Itoa(pr.Number))
 	// Use a longer TTL for PR caching (20 days) since we validate with updated_at
 	c.cache.SetWithTTL(cacheKey, pr, 20*24*time.Hour)
 }

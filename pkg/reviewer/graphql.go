@@ -78,8 +78,8 @@ func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string
 	}
 
 	// Check for GraphQL errors in response
-	if errors, ok := result["errors"]; ok {
-		slog.WarnContext(ctx, "GraphQL blame query returned errors", "errors", errors)
+	if gqlErrors, ok := result["errors"]; ok {
+		slog.WarnContext(ctx, "GraphQL blame query returned errors", "errors", gqlErrors)
 	}
 
 	// Parse blame results - get both overlapping and all PRs
@@ -96,6 +96,8 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 	var allPRs []types.PRInfo
 	seenOverlapping := make(map[int]bool)
 	seenAll := make(map[int]bool)
+	seenOverlappingCommits := make(map[string]bool)
+	seenAllCommits := make(map[string]bool)
 
 	data, ok := mapValue(result, "data")
 	if !ok {
@@ -143,8 +145,14 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 			continue
 		}
 
-		startLine, _ := rangeMap["startingLine"].(float64)
-		endLine, _ := rangeMap["endingLine"].(float64)
+		startLine, ok := rangeMap["startingLine"].(float64)
+		if !ok {
+			continue
+		}
+		endLine, ok := rangeMap["endingLine"].(float64)
+		if !ok {
+			continue
+		}
 
 		// Check if this blame range overlaps with any of our changed line ranges
 		overlaps := false
@@ -160,6 +168,16 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 			continue
 		}
 
+		// Extract commit author (fallback for direct commits without PRs)
+		var commitAuthor string
+		if author, ok := mapValue(commit, "author"); ok {
+			if user, ok := mapValue(author, "user"); ok {
+				if login, ok := user["login"].(string); ok {
+					commitAuthor = login
+				}
+			}
+		}
+
 		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
 		if !ok {
 			continue
@@ -167,6 +185,34 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 
 		nodes, ok := associatedPRs["nodes"].([]any)
 		if !ok || len(nodes) == 0 {
+			// No PR associated - use commit author directly if available
+			if commitAuthor == "" {
+				slog.Debug("Skipping commit with no PR and no author")
+				continue
+			}
+
+			// Create a pseudo-PR entry for this direct commit
+			pr := types.PRInfo{
+				Number:    0, // Use 0 to indicate direct commit
+				Author:    commitAuthor,
+				LineCount: int(endLine) - int(startLine) + 1,
+			}
+
+			if overlaps {
+				// Overlapping lines - always include
+				if !seenOverlappingCommits[commitAuthor] {
+					seenOverlappingCommits[commitAuthor] = true
+					overlappingPRs = append(overlappingPRs, pr)
+					slog.Debug("Added overlapping commit author", "author", commitAuthor, "line_count", pr.LineCount)
+				}
+			} else {
+				// Non-overlapping file contributor from direct commit
+				if !seenAllCommits[commitAuthor] {
+					seenAllCommits[commitAuthor] = true
+					allPRs = append(allPRs, pr)
+					slog.Debug("Added non-overlapping commit author", "author", commitAuthor)
+				}
+			}
 			continue
 		}
 
@@ -176,8 +222,14 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 			continue
 		}
 
-		prNumber, _ := prNode["number"].(float64)
-		merged, _ := prNode["merged"].(bool)
+		prNumber, ok := prNode["number"].(float64)
+		if !ok {
+			continue
+		}
+		merged, ok := prNode["merged"].(bool)
+		if !ok {
+			continue
+		}
 		if !merged {
 			continue // Only consider merged PRs
 		}
@@ -235,30 +287,28 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 				overlappingPRs = append(overlappingPRs, pr)
 				slog.Debug("Added overlapping PR", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "line_count", pr.LineCount)
 			}
-		} else {
-			// Non-overlapping - only include if within last year
-			if mergedAt.IsZero() {
-				slog.Debug("Skipping non-overlapping PR (no mergedAt)", "pr_number", int(prNumber), "author", pr.Author)
-			} else if !mergedAt.After(oneYearAgo) {
-				slog.Debug("Skipping non-overlapping PR (too old)", "pr_number", int(prNumber), "author", pr.Author, "merged_at", mergedAt)
-			} else {
-				if !seenAll[int(prNumber)] {
-					seenAll[int(prNumber)] = true
-					allPRs = append(allPRs, pr)
-					slog.Debug("Added non-overlapping file contributor", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "merged_at", mergedAt)
-				}
-			}
+		} else if mergedAt.IsZero() {
+			// Non-overlapping - skip if no mergedAt
+			slog.Debug("Skipping non-overlapping PR (no mergedAt)", "pr_number", int(prNumber), "author", pr.Author)
+		} else if !mergedAt.After(oneYearAgo) {
+			// Non-overlapping - skip if too old
+			slog.Debug("Skipping non-overlapping PR (too old)", "pr_number", int(prNumber), "author", pr.Author, "merged_at", mergedAt)
+		} else if !seenAll[int(prNumber)] {
+			// Non-overlapping - include if within last year and not seen
+			seenAll[int(prNumber)] = true
+			allPRs = append(allPRs, pr)
+			slog.Debug("Added non-overlapping file contributor", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "merged_at", mergedAt)
 		}
 	}
 
 	return overlappingPRs, allPRs
 }
 
-// recentPRsInDirectory finds recent PRs that modified files in a directory.
-func (f *Finder) recentPRsInDirectory(ctx context.Context, owner, repo, directory string) ([]types.PRInfo, error) {
-	slog.InfoContext(ctx, "Querying historical PRs in directory", "directory", directory, "owner", owner, "repo", repo)
+// recentCommitsInDirectory finds recent commits in a directory and their associated PRs.
+func (f *Finder) recentCommitsInDirectory(ctx context.Context, owner, repo, dirPath string, limit int) ([]types.PRInfo, error) {
+	slog.InfoContext(ctx, "Querying recent commits in directory", "owner", owner, "repo", repo, "dir", dirPath, "limit", limit)
 
-	cacheKey := fmt.Sprintf("prs-dir:%s/%s:%s", owner, repo, directory)
+	cacheKey := fmt.Sprintf("commits-dir:%s/%s:%s:%d", owner, repo, dirPath, limit)
 	if cached, found := f.cache.Get(cacheKey); found {
 		slog.DebugContext(ctx, "Cache hit", "key", cacheKey)
 		if prs, ok := cached.([]types.PRInfo); ok {
@@ -267,23 +317,35 @@ func (f *Finder) recentPRsInDirectory(ctx context.Context, owner, repo, director
 		slog.WarnContext(ctx, "Cache type assertion failed", "key", cacheKey)
 	}
 
+	// GraphQL query to get recent commits in a directory
+	// Try both main and master branches
 	query := `
-	query($owner: String!, $repo: String!, $path: String!) {
+	query($owner: String!, $repo: String!, $path: String!, $limit: Int!) {
 		repository(owner: $owner, name: $repo) {
 			defaultBranchRef {
+				name
 				target {
 					... on Commit {
-						history(first: 10, path: $path) {
+						history(first: $limit, path: $path) {
 							nodes {
-								associatedPullRequests(first: 3) {
+								oid
+								author {
+									user {
+										login
+									}
+								}
+								associatedPullRequests(first: 1) {
 									nodes {
 										number
 										merged
+										mergedAt
 										author {
 											login
 										}
-										mergedAt
-										reviews(first: 5, states: APPROVED) {
+										mergedBy {
+											login
+										}
+										reviews(first: 10, states: APPROVED) {
 											nodes {
 												author {
 													login
@@ -303,7 +365,8 @@ func (f *Finder) recentPRsInDirectory(ctx context.Context, owner, repo, director
 	variables := map[string]any{
 		"owner": owner,
 		"repo":  repo,
-		"path":  directory,
+		"path":  dirPath,
+		"limit": limit,
 	}
 
 	result, err := f.client.MakeGraphQLRequest(ctx, query, variables)
@@ -311,11 +374,93 @@ func (f *Finder) recentPRsInDirectory(ctx context.Context, owner, repo, director
 		return nil, fmt.Errorf("GraphQL request failed: %w", err)
 	}
 
-	prs, err := f.parsePRsFromGraphQL(result)
-	if err == nil && len(prs) > 0 {
-		f.cache.Set(cacheKey, prs)
+	prs := f.parseDirectoryCommitsFromGraphQL(result)
+	slog.InfoContext(ctx, "Parsed directory commits", "unique_prs", len(prs), "from_commits", limit)
+
+	f.cache.Set(cacheKey, prs)
+	return prs, nil
+}
+
+// parseDirectoryCommitsFromGraphQL extracts PR info from directory commit history.
+func (*Finder) parseDirectoryCommitsFromGraphQL(result map[string]any) []types.PRInfo {
+	var prs []types.PRInfo
+	seenPRs := make(map[int]bool)
+	seenCommitAuthors := make(map[string]bool)
+
+	data, ok := mapValue(result, "data")
+	if !ok {
+		return prs
 	}
-	return prs, err
+
+	repository, ok := mapValue(data, "repository")
+	if !ok {
+		return prs
+	}
+
+	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
+	if !ok {
+		slog.Debug("No defaultBranchRef field")
+		return prs
+	}
+
+	target, ok := mapValue(defaultBranchRef, "target")
+	if !ok {
+		return prs
+	}
+
+	history, ok := mapValue(target, "history")
+	if !ok {
+		return prs
+	}
+
+	nodes, ok := sliceNodes(history)
+	if !ok {
+		return prs
+	}
+
+	for _, node := range nodes {
+		commitNode, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Extract commit author for direct commits without PRs
+		var commitAuthor string
+		if author, ok := mapValue(commitNode, "author"); ok {
+			if user, ok := mapValue(author, "user"); ok {
+				if login, ok := user["login"].(string); ok {
+					commitAuthor = login
+				}
+			}
+		}
+
+		associatedPRs, ok := mapValue(commitNode, "associatedPullRequests")
+		if !ok {
+			continue
+		}
+
+		prNodes, ok := sliceNodes(associatedPRs)
+		if !ok || len(prNodes) == 0 {
+			// No PR - use commit author if available
+			if commitAuthor != "" && !seenCommitAuthors[commitAuthor] {
+				seenCommitAuthors[commitAuthor] = true
+				prs = append(prs, types.PRInfo{
+					Number: 0,
+					Author: commitAuthor,
+				})
+			}
+			continue
+		}
+
+		// Take first associated PR
+		prInfo := parsePRNode(prNodes[0].(map[string]any))
+		if prInfo != nil && !seenPRs[prInfo.Number] {
+			seenPRs[prInfo.Number] = true
+			prs = append(prs, *prInfo)
+		}
+	}
+
+	return prs
 }
 
 // recentPRsInProject finds recent merged PRs in the project.
@@ -402,8 +547,8 @@ func (f *Finder) recentPRsInProject(ctx context.Context, owner, repo string) ([]
 	if !ok {
 		return allPRs, nil
 	}
-	hasNextPage, _ := pageInfo["hasNextPage"].(bool)
-	if !hasNextPage {
+	hasNextPage, ok := pageInfo["hasNextPage"].(bool)
+	if !ok || !hasNextPage {
 		slog.InfoContext(ctx, "Fetched all recent PRs", "count", len(allPRs))
 		f.cache.Set(cacheKey, allPRs)
 		return allPRs, nil
@@ -461,153 +606,6 @@ func (f *Finder) recentPRsInProject(ctx context.Context, owner, repo string) ([]
 	return allPRs, nil
 }
 
-// historicalPRsForFile finds merged PRs that modified a specific file.
-func (f *Finder) historicalPRsForFile(ctx context.Context, owner, repo, filepath string, limit int) ([]types.PRInfo, error) {
-	slog.InfoContext(ctx, "Querying historical PRs for file", "file", filepath, "owner", owner, "repo", repo, "limit", limit)
-
-	cacheKey := fmt.Sprintf("prs-file:%s/%s:%s:%d", owner, repo, filepath, limit)
-	if cached, found := f.cache.Get(cacheKey); found {
-		slog.DebugContext(ctx, "Cache hit", "key", cacheKey)
-		if prs, ok := cached.([]types.PRInfo); ok {
-			return prs, nil
-		}
-		slog.WarnContext(ctx, "Cache type assertion failed", "key", cacheKey)
-	}
-
-	query := `
-	query($owner: String!, $repo: String!, $path: String!) {
-		repository(owner: $owner, name: $repo) {
-			defaultBranchRef {
-				target {
-					... on Commit {
-						history(first: 10, path: $path) {
-							nodes {
-								oid
-								author {
-									user {
-										login
-									}
-								}
-								associatedPullRequests(first: 1, orderBy: {field: UPDATED_AT, direction: DESC}) {
-									nodes {
-										number
-										state
-										merged
-										author {
-											login
-										}
-										mergedAt
-										mergedBy {
-											login
-										}
-										reviews(first: 5, states: APPROVED) {
-											nodes {
-												author {
-													login
-												}
-											}
-										}
-										files(first: 50) {
-											nodes {
-												path
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}`
-
-	variables := map[string]any{
-		"owner": owner,
-		"repo":  repo,
-		"path":  filepath,
-	}
-
-	result, err := f.client.MakeGraphQLRequest(ctx, query, variables)
-	if err != nil {
-		return nil, fmt.Errorf("GraphQL request failed: %w", err)
-	}
-
-	prs, err := f.parseHistoricalPRsFromGraphQL(result, filepath)
-	if err == nil && len(prs) > 0 {
-		f.cache.Set(cacheKey, prs)
-	}
-	return prs, err
-}
-
-// parsePRsFromGraphQL extracts PR info from GraphQL response.
-func (*Finder) parsePRsFromGraphQL(result map[string]any) ([]types.PRInfo, error) {
-	var prs []types.PRInfo
-
-	data, ok := mapValue(result, "data")
-	if !ok {
-		return nil, errors.New("invalid GraphQL response format")
-	}
-
-	repository, ok := mapValue(data, "repository")
-	if !ok {
-		return nil, errors.New("repository not found in response")
-	}
-
-	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
-	if !ok {
-		return nil, errors.New("defaultBranchRef not found")
-	}
-
-	target, ok := mapValue(defaultBranchRef, "target")
-	if !ok {
-		return nil, errors.New("target not found")
-	}
-
-	history, ok := mapValue(target, "history")
-	if !ok {
-		return nil, errors.New("history not found")
-	}
-
-	nodes, ok := sliceNodes(history)
-	if !ok {
-		return nil, errors.New("nodes not found")
-	}
-
-	seen := make(map[int]bool)
-	for _, node := range nodes {
-		commit, ok := node.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
-		if !ok {
-			continue
-		}
-
-		prNodes, ok := sliceNodes(associatedPRs)
-		if !ok {
-			continue
-		}
-
-		for _, prNode := range prNodes {
-			pr, ok := prNode.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			prInfo := parsePRNode(pr)
-			if prInfo != nil && !seen[prInfo.Number] {
-				seen[prInfo.Number] = true
-				prs = append(prs, *prInfo)
-			}
-		}
-	}
-
-	return prs, nil
-}
-
 // parseProjectPRsFromGraphQL extracts PR info from project-wide GraphQL response.
 func (*Finder) parseProjectPRsFromGraphQL(result map[string]any) ([]types.PRInfo, error) {
 	var prs []types.PRInfo
@@ -647,100 +645,6 @@ func (*Finder) parseProjectPRsFromGraphQL(result map[string]any) ([]types.PRInfo
 	return prs, nil
 }
 
-// parseHistoricalPRsFromGraphQL extracts PR info from historical file query.
-func (*Finder) parseHistoricalPRsFromGraphQL(result map[string]any, targetFile string) ([]types.PRInfo, error) {
-	var prs []types.PRInfo
-	seen := make(map[int]bool)
-
-	data, ok := mapValue(result, "data")
-	if !ok {
-		return nil, errors.New("invalid GraphQL response format")
-	}
-
-	repository, ok := mapValue(data, "repository")
-	if !ok {
-		return nil, errors.New("repository not found in response")
-	}
-
-	defaultBranchRef, ok := mapValue(repository, "defaultBranchRef")
-	if !ok {
-		return nil, errors.New("defaultBranchRef not found")
-	}
-
-	target, ok := mapValue(defaultBranchRef, "target")
-	if !ok {
-		return nil, errors.New("target not found")
-	}
-
-	history, ok := mapValue(target, "history")
-	if !ok {
-		return nil, errors.New("history not found")
-	}
-
-	nodes, ok := sliceNodes(history)
-	if !ok {
-		return nil, errors.New("nodes not found")
-	}
-
-	for _, node := range nodes {
-		commit, ok := node.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		associatedPRs, ok := mapValue(commit, "associatedPullRequests")
-		if !ok {
-			continue
-		}
-
-		prNodes, ok := sliceNodes(associatedPRs)
-		if !ok || len(prNodes) == 0 {
-			continue
-		}
-
-		for _, prNode := range prNodes {
-			pr, ok := prNode.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			files, ok := mapValue(pr, "files")
-			if !ok {
-				continue
-			}
-
-			fileNodes, ok := sliceNodes(files)
-			if !ok {
-				continue
-			}
-
-			fileFound := false
-			for _, fileNode := range fileNodes {
-				file, ok := fileNode.(map[string]any)
-				if !ok {
-					continue
-				}
-				if path, ok := stringValue(file, "path"); ok && path == targetFile {
-					fileFound = true
-					break
-				}
-			}
-
-			if !fileFound {
-				continue
-			}
-
-			prInfo := parsePRNode(pr)
-			if prInfo != nil && !seen[prInfo.Number] {
-				seen[prInfo.Number] = true
-				prs = append(prs, *prInfo)
-			}
-		}
-	}
-
-	return prs, nil
-}
-
 // Helper functions for navigating GraphQL responses.
 
 func mapValue(data map[string]any, key string) (map[string]any, bool) {
@@ -753,7 +657,7 @@ func mapValue(data map[string]any, key string) (map[string]any, bool) {
 }
 
 func sliceNodes(data map[string]any) ([]any, bool) {
-	val, ok := data[graphQLNodes]
+	val, ok := data["nodes"]
 	if !ok {
 		return nil, false
 	}

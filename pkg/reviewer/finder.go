@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
 	"time"
 
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/cache"
@@ -48,12 +47,13 @@ func (f *Finder) Find(ctx context.Context, pr *types.PullRequest) ([]types.Revie
 		slog.Warn("Failed to check small team project (continuing)", "error", err)
 	} else if totalMembers >= 0 && totalMembers <= 2 {
 		// Short-circuit for small teams (0-2 valid members excluding PR author)
-		if len(smallTeamMembers) == 0 {
+		switch len(smallTeamMembers) {
+		case 0:
 			slog.Info("Project has no valid reviewers (single-person project or PR author is only member)")
 			return nil, nil
-		} else if len(smallTeamMembers) == 1 {
+		case 1:
 			slog.Info("Project has single member, assigning to them", "member", smallTeamMembers[0])
-		} else {
+		default:
 			slog.Info("Project has 2 members, assigning both", "members", smallTeamMembers)
 		}
 		candidates := make([]types.ReviewerCandidate, len(smallTeamMembers))
@@ -91,97 +91,11 @@ func (f *Finder) isValidReviewer(ctx context.Context, pr *types.PullRequest, use
 	return true
 }
 
-// calculateWorkloadPenalty returns a score penalty based on PR count (not a hard filter).
-func (f *Finder) calculateWorkloadPenalty(ctx context.Context, pr *types.PullRequest, username string) int {
-	prCount, err := f.client.OpenPRCount(ctx, pr.Owner, username, f.prCountCache)
-	if err != nil {
-		slog.Debug("Could not check PR count, no penalty applied", "username", username, "org", pr.Owner, "error", err)
-		return 0 // No penalty if we can't check
-	}
-
-	if prCount == 0 {
-		return 0 // No penalty for no open PRs
-	}
-
-	// Apply progressive penalty: 10 points per PR to significantly deprioritize busy reviewers
-	// but never makes them ineligible. This is a soft signal, not a hard filter.
-	penalty := prCount * 10
-	slog.Debug("Workload penalty applied", "username", username, "pr_count", prCount, "penalty", penalty)
-	return penalty
-}
-
-// changedFiles returns the list of changed files, limiting to the most changed.
-func (f *Finder) changedFiles(pr *types.PullRequest) []string {
-	// Sort by total changes (additions + deletions)
-	type fileChange struct {
-		name    string
-		changes int
-	}
-
-	fileChanges := make([]fileChange, 0, len(pr.ChangedFiles))
-	for _, file := range pr.ChangedFiles {
-		fileChanges = append(fileChanges, fileChange{
-			name:    file.Filename,
-			changes: file.Additions + file.Deletions,
-		})
-	}
-
-	// Sort by changes (descending)
-	sort.Slice(fileChanges, func(i, j int) bool {
-		return fileChanges[i].changes > fileChanges[j].changes
-	})
-
-	// Extract filenames, limit to maxFilesToAnalyze
-	files := make([]string, 0, len(fileChanges))
-	for i, fc := range fileChanges {
-		if i >= maxFilesToAnalyze {
-			break
-		}
-		files = append(files, fc.name)
-	}
-
-	return files
-}
-
-// fetchAllPRFiles fetches all file patches for a PR.
-func (f *Finder) fetchAllPRFiles(ctx context.Context, owner, repo string, prNumber int) (map[string]string, error) {
-	// Check cache first
-	cacheKey := makeCacheKey("pr-files", owner, repo, prNumber)
-	if cached, found := f.cache.Get(cacheKey); found {
-		if patches, ok := cached.(map[string]string); ok {
-			slog.Info("  📦 Using cached PR file patches")
-			return patches, nil
-		}
-	}
-
-	slog.Info("Fetching all file patches for PR", "pr", prNumber)
-
-	// Fetch changed files
-	files, err := f.client.ChangedFiles(ctx, owner, repo, prNumber)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch changed files: %w", err)
-	}
-
-	// Build patch cache from changed files (patches are already included)
-	patches := make(map[string]string)
-	for _, file := range files {
-		if file.Patch != "" {
-			patches[file.Filename] = file.Patch
-		}
-	}
-
-	// Cache the result
-	f.cache.SetWithTTL(cacheKey, patches, fileHistoryCacheTTL)
-	slog.Info("Fetched and cached file patches", "count", len(patches))
-
-	return patches, nil
-}
-
 // checkSmallTeamProject checks if the project has only 0-2 members with write access.
 // Returns (valid members, total count, error).
 // Valid members excludes the PR author and bots. Total count is the number of valid members.
 // Returns count=-1 if there are more than 2 valid members (no short-circuit needed).
-func (f *Finder) checkSmallTeamProject(ctx context.Context, pr *types.PullRequest) ([]string, int, error) {
+func (f *Finder) checkSmallTeamProject(ctx context.Context, pr *types.PullRequest) (members []string, count int, err error) {
 	type cachedResult struct {
 		Members []string
 		Count   int
@@ -197,13 +111,13 @@ func (f *Finder) checkSmallTeamProject(ctx context.Context, pr *types.PullReques
 
 	slog.InfoContext(ctx, "Checking for small team project", "owner", pr.Owner, "repo", pr.Repository)
 
-	members, err := f.client.Collaborators(ctx, pr.Owner, pr.Repository)
+	collaborators, err := f.client.Collaborators(ctx, pr.Owner, pr.Repository)
 	if err != nil {
 		return nil, -1, fmt.Errorf("failed to fetch collaborators: %w", err)
 	}
 
 	var validMembers []string
-	for _, member := range members {
+	for _, member := range collaborators {
 		if member == pr.Author {
 			continue
 		}
@@ -213,9 +127,9 @@ func (f *Finder) checkSmallTeamProject(ctx context.Context, pr *types.PullReques
 		validMembers = append(validMembers, member)
 	}
 
-	slog.InfoContext(ctx, "Found project members", "total", len(members), "valid", len(validMembers), "pr_author", pr.Author)
+	slog.InfoContext(ctx, "Found project members", "total", len(collaborators), "valid", len(validMembers), "pr_author", pr.Author)
 
-	count := len(validMembers)
+	count = len(validMembers)
 	var result []string
 
 	// Only cache small teams (0-2 members) for short-circuit optimization

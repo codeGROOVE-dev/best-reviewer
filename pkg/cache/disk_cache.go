@@ -22,26 +22,26 @@ const (
 	cacheFilePerms = 0o600
 )
 
-// Recommended TTLs for different data types
+// Recommended TTLs for different data types.
 const (
-	// TTLCurrentPR should NOT be used for the PR being examined - fetch it fresh every time
+	// TTLCurrentPR should NOT be used for the PR being examined - fetch it fresh every time.
 
-	// TTLWorkload is for user PR counts (changes frequently)
+	// TTLWorkload is for user PR counts (changes frequently).
 	TTLWorkload = 2 * time.Hour
 
-	// TTLCollaborators is for repo collaborator lists (changes occasionally)
+	// TTLCollaborators is for repo collaborator lists (changes occasionally).
 	TTLCollaborators = 6 * time.Hour
 
-	// TTLRecentActivity is for recent merged PRs, directory activity (changes daily)
+	// TTLRecentActivity is for recent merged PRs, directory activity (changes daily).
 	TTLRecentActivity = 4 * time.Hour
 
-	// TTLHistoricalPR is for merged PR data used in overlap/history analysis (immutable once merged)
+	// TTLHistoricalPR is for merged PR data used in overlap/history analysis (immutable once merged).
 	TTLHistoricalPR = 28 * 24 * time.Hour // 28 days
 
-	// TTLFileHistory is for file history queries (changes slowly)
+	// TTLFileHistory is for file history queries (changes slowly).
 	TTLFileHistory = 3 * 24 * time.Hour // 3 days
 
-	// TTLUserDetails is for user profile data (changes very rarely)
+	// TTLUserDetails is for user profile data (changes very rarely).
 	TTLUserDetails = 7 * 24 * time.Hour // 7 days
 )
 
@@ -188,7 +188,7 @@ func (c *DiskCache) SetWithTTL(key string, value any, ttl time.Duration) {
 }
 
 // cacheKey generates a SHA256 hash of the key for the filename.
-func (c *DiskCache) cacheKey(key string) string {
+func (*DiskCache) cacheKey(key string) string {
 	hash := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(hash[:])
 }
@@ -231,18 +231,26 @@ func (c *DiskCache) saveToDisk(key string, v any) error {
 
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(v); err != nil {
-		_ = file.Close()
-		_ = os.Remove(tmpPath)
+		if closeErr := file.Close(); closeErr != nil {
+			slog.Debug("Failed to close file during cleanup", "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			slog.Debug("Failed to remove temp file during cleanup", "error", removeErr)
+		}
 		return fmt.Errorf("encoding cache data: %w", err)
 	}
 
 	if err := file.Close(); err != nil {
-		_ = os.Remove(tmpPath)
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			slog.Debug("Failed to remove temp file during cleanup", "error", removeErr)
+		}
 		return fmt.Errorf("closing cache file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			slog.Debug("Failed to remove temp file during cleanup", "error", removeErr)
+		}
 		return fmt.Errorf("renaming cache file: %w", err)
 	}
 

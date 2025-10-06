@@ -77,6 +77,11 @@ func (c *Client) getToken() string {
 	return c.token
 }
 
+// Token returns the current GitHub token for external use (e.g., sprinkler).
+func (c *Client) Token(ctx context.Context) (string, error) {
+	return c.getToken(), nil
+}
+
 // drainAndCloseBody drains and closes an HTTP response body to prevent resource leaks.
 func drainAndCloseBody(body io.ReadCloser) {
 	if _, err := io.Copy(io.Discard, body); err != nil {

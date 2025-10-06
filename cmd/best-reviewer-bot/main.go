@@ -114,11 +114,12 @@ func main() {
 	finder := reviewer.New(client, finderCfg)
 
 	bot := &Bot{
-		client:      client,
-		finder:      finder,
-		dryRun:      *dryRun,
-		minOpenTime: *minOpenTime,
-		maxOpenTime: *maxOpenTime,
+		client:            client,
+		finder:            finder,
+		sprinklerMonitors: make(map[string]*sprinklerMonitor),
+		dryRun:            *dryRun,
+		minOpenTime:       *minOpenTime,
+		maxOpenTime:       *maxOpenTime,
 	}
 
 	if *serve {
@@ -135,12 +136,13 @@ func main() {
 
 // Bot manages reviewer assignment across all installed organizations.
 type Bot struct {
-	client      *github.Client
-	finder      *reviewer.Finder
-	metrics     *MetricsCollector
-	dryRun      bool
-	minOpenTime time.Duration
-	maxOpenTime time.Duration
+	client            *github.Client
+	finder            *reviewer.Finder
+	metrics           *MetricsCollector
+	sprinklerMonitors map[string]*sprinklerMonitor // One monitor per org
+	dryRun            bool
+	minOpenTime       time.Duration
+	maxOpenTime       time.Duration
 }
 
 // processAllOrgs processes all organizations where the GitHub app is installed.
@@ -181,6 +183,28 @@ func (b *Bot) processAllOrgs(ctx context.Context) error {
 		"assigned", totalAssigned,
 		"skipped", totalSkipped,
 		"orgs", len(orgs))
+
+	return nil
+}
+
+// processSinglePR processes a single PR by owner, repo, and number (used by sprinkler).
+func (b *Bot) processSinglePR(ctx context.Context, owner, repo string, prNumber int) error {
+	// Fetch the PR
+	pr, err := b.client.PullRequest(ctx, owner, repo, prNumber)
+	if err != nil {
+		return fmt.Errorf("failed to fetch PR: %w", err)
+	}
+
+	// Record metrics
+	if b.metrics != nil {
+		b.metrics.RecordPRSeen(owner, repo, prNumber)
+	}
+
+	// Process the PR
+	wasAssigned := b.processPR(ctx, pr)
+	if wasAssigned && b.metrics != nil {
+		b.metrics.RecordPRModified(owner, repo, prNumber)
+	}
 
 	return nil
 }
@@ -295,7 +319,7 @@ func (b *Bot) isPRReady(pr *types.PullRequest) bool {
 }
 
 // assignReviewers assigns reviewers to a PR.
-func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
+func (*Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers",
 		pr.Owner, pr.Repository, pr.Number)
 
@@ -313,7 +337,7 @@ func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, review
 }
 
 // listOrgRepos lists all repositories for an organization.
-func (b *Bot) listOrgRepos(ctx context.Context, org string) ([]string, error) {
+func (*Bot) listOrgRepos(ctx context.Context, org string) ([]string, error) {
 	// This would need to be implemented in the github package
 	// For now, return empty list
 	_ = ctx
@@ -326,10 +350,45 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 	b.metrics = NewMetricsCollector()
 
 	// Start health server in background
-	go b.startHealthServer()
+	go b.startHealthServer(ctx)
 
 	time.Sleep(100 * time.Millisecond)
 	slog.Info("Service started in server mode", "loop_delay", loopDelay)
+
+	// Initialize and start one sprinkler monitor per org
+	orgs, err := b.client.ListAppInstallations(ctx)
+	if err != nil {
+		slog.Warn("Failed to list organizations for sprinkler", "error", err)
+	} else {
+		for _, org := range orgs {
+			// Set current org to get its installation token
+			b.client.SetCurrentOrg(org)
+			token, err := b.client.Token(ctx)
+			b.client.SetCurrentOrg("")
+
+			if err != nil {
+				slog.Error("Failed to get token for org", "org", org, "error", err)
+				continue
+			}
+
+			// Create and start sprinkler for this org
+			monitor := newSprinklerMonitor(b, token, org)
+			if err := monitor.start(ctx); err != nil {
+				slog.Error("Failed to start sprinkler for org", "org", org, "error", err)
+				continue
+			}
+			b.sprinklerMonitors[org] = monitor
+			slog.Info("Started sprinkler monitor", "org", org)
+		}
+
+		// Stop all monitors on shutdown
+		defer func() {
+			for org, monitor := range b.sprinklerMonitors {
+				slog.Info("Stopping sprinkler monitor", "org", org)
+				monitor.stop()
+			}
+		}()
+	}
 
 	// Run immediately, then loop
 	for {
@@ -344,6 +403,9 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 			if err := b.processAllOrgs(ctx); err != nil {
 				slog.Error("Failed to process app installations", "error", err)
 			}
+
+			// Check for new/removed orgs and update sprinkler monitors
+			b.updateSprinklerMonitors(ctx)
 
 			b.metrics.RecordRunComplete()
 			duration := time.Since(startTime)
@@ -362,8 +424,59 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 	}
 }
 
+// updateSprinklerMonitors checks for new/removed orgs and updates sprinkler monitors accordingly.
+func (b *Bot) updateSprinklerMonitors(ctx context.Context) {
+	orgs, err := b.client.ListAppInstallations(ctx)
+	if err != nil {
+		slog.Warn("Failed to list organizations for sprinkler update", "error", err)
+		return
+	}
+
+	// Build set of current orgs
+	currentOrgs := make(map[string]bool)
+	for _, org := range orgs {
+		currentOrgs[org] = true
+	}
+
+	// Stop monitors for removed orgs
+	for org, monitor := range b.sprinklerMonitors {
+		if !currentOrgs[org] {
+			slog.Info("Stopping sprinkler for removed org", "org", org)
+			monitor.stop()
+			delete(b.sprinklerMonitors, org)
+		}
+	}
+
+	// Start monitors for new orgs
+	for _, org := range orgs {
+		if _, exists := b.sprinklerMonitors[org]; exists {
+			continue // Already monitoring
+		}
+
+		// Get installation token for this org
+		b.client.SetCurrentOrg(org)
+		token, err := b.client.Token(ctx)
+		b.client.SetCurrentOrg("")
+
+		if err != nil {
+			slog.Error("Failed to get token for new org", "org", org, "error", err)
+			continue
+		}
+
+		// Create and start sprinkler for this org
+		monitor := newSprinklerMonitor(b, token, org)
+		if err := monitor.start(ctx); err != nil {
+			slog.Error("Failed to start sprinkler for new org", "org", org, "error", err)
+			continue
+		}
+
+		b.sprinklerMonitors[org] = monitor
+		slog.Info("Started sprinkler monitor for new org", "org", org)
+	}
+}
+
 // startHealthServer starts the HTTP server for health checks.
-func (b *Bot) startHealthServer() {
+func (b *Bot) startHealthServer(ctx context.Context) {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -402,8 +515,9 @@ func (b *Bot) startHealthServer() {
 		b.metrics.isPolling = true
 
 		// Start background polling with a detached context since HTTP request will complete
+		// Use context.WithoutCancel to inherit values but allow goroutine to outlive handler
 		go func() {
-			ctx := context.Background()
+			pollCtx := context.WithoutCancel(ctx)
 			defer func() {
 				b.metrics.isPolling = false
 				b.metrics.pollingMu.Unlock()
@@ -412,7 +526,7 @@ func (b *Bot) startHealthServer() {
 			slog.Info("Manual poll triggered")
 			startTime := time.Now()
 
-			if err := b.processAllOrgs(ctx); err != nil {
+			if err := b.processAllOrgs(pollCtx); err != nil {
 				slog.Error("Manual poll failed", "error", err)
 			} else {
 				b.metrics.RecordRunComplete()
