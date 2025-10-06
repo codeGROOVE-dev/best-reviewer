@@ -17,7 +17,6 @@ import (
 )
 
 var (
-	prURL        = flag.String("pr", "", "Pull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)")
 	verbose      = flag.Bool("v", false, "Verbose output with detailed diagnostics")
 	maxPRs       = flag.Int("max-prs", 9, "Maximum number of non-stale open PRs a candidate can have")
 	prCountCache = flag.Duration("pr-count-cache", 6*time.Hour, "Cache duration for PR count queries")
@@ -25,21 +24,25 @@ var (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s -pr <PR_URL> [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <PR_URL> [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Analyzes a GitHub pull request and recommends the top 5 reviewers.\n\n")
+		fmt.Fprintf(os.Stderr, "Arguments:\n")
+		fmt.Fprintf(os.Stderr, "  PR_URL    Pull request URL (e.g., https://github.com/owner/repo/pull/123 or owner/repo#123)\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s -pr https://github.com/owner/repo/pull/123\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -pr owner/repo#123\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -pr owner/repo#123 -v\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s https://github.com/owner/repo/pull/123\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s owner/repo#123\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s owner/repo#123 -v\n", os.Args[0])
 	}
 	flag.Parse()
 
-	if *prURL == "" {
+	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	prURL := flag.Arg(0)
 
 	// Set up structured logging
 	logLevel := slog.LevelInfo
@@ -54,7 +57,7 @@ func main() {
 	ctx := context.Background()
 
 	// Parse PR URL
-	owner, repo, prNumber, err := parsePRURL(*prURL)
+	owner, repo, prNumber, err := parsePRURL(prURL)
 	if err != nil {
 		slog.Error("Invalid PR URL", "error", err)
 		os.Exit(1)

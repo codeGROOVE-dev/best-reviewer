@@ -175,10 +175,17 @@ func (c *Client) HasWriteAccess(ctx context.Context, owner, repo, username strin
 
 	// GitHub returns 204 No Content if user is a collaborator
 	// Returns 404 if not a collaborator
+	// Returns 403 if we don't have permission to check (treat as "unknown" - allow through)
 	if resp.StatusCode == http.StatusNoContent {
 		return true
 	}
 
+	if resp.StatusCode == http.StatusForbidden {
+		slog.Warn("Insufficient permissions to check write access, assuming access granted", "username", username, "owner", owner, "repo", repo)
+		return true // Graceful degradation - allow candidate through when we can't verify
+	}
+
+	// Only 404 (Not Found) definitively means no write access
 	return false
 }
 
