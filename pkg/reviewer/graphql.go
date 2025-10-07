@@ -453,7 +453,11 @@ func (*Finder) parseDirectoryCommitsFromGraphQL(result map[string]any) []types.P
 		}
 
 		// Take first associated PR
-		prInfo := parsePRNode(prNodes[0].(map[string]any))
+		prNode, ok := prNodes[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		prInfo := parsePRNode(prNode)
 		if prInfo != nil && !seenPRs[prInfo.Number] {
 			seenPRs[prInfo.Number] = true
 			prs = append(prs, *prInfo)

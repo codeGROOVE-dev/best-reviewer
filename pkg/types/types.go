@@ -14,6 +14,7 @@ type PullRequest struct {
 	Author       string
 	Repository   string
 	Owner        string
+	TestState    string // "passing", "failing", "pending", "queued", "running", or ""
 	ChangedFiles []ChangedFile
 	Assignees    []string
 	Reviewers    []string

@@ -16,6 +16,7 @@ import (
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/github"
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/reviewer"
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/types"
+	"github.com/codeGROOVE-dev/prx/pkg/prx"
 )
 
 var (
@@ -24,13 +25,23 @@ var (
 	appKeyPath = flag.String("app-key-path", "", "Path to GitHub App private key file")
 
 	// Behavior flags.
-	loopDelay   = flag.Duration("loop-delay", 20*time.Minute, "Loop delay between polling cycles (default: 20m)")
+	loopDelay   = flag.Duration("loop-delay", 5*time.Minute, "Loop delay between polling cycles (default: 5m)")
 	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
 	minOpenTime = flag.Duration("min-age", 0, "Minimum time since last activity for PR assignment")
 	maxOpenTime = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
 
 	prCountCache = flag.Duration("pr-count-cache", 6*time.Hour, "Cache duration for PR count queries")
 )
+
+// prxClientWrapper wraps prx.Client to satisfy the interface expected by github.Client.
+type prxClientWrapper struct {
+	client *prx.Client
+}
+
+// PullRequestWithReferenceTime wraps the prx.Client.PullRequestWithReferenceTime method to return any.
+func (w *prxClientWrapper) PullRequestWithReferenceTime(ctx context.Context, owner, repo string, prNumber int, referenceTime time.Time) (any, error) {
+	return w.client.PullRequestWithReferenceTime(ctx, owner, repo, prNumber, referenceTime)
+}
 
 // MetricsCollector tracks metrics for the health endpoint.
 type MetricsCollector struct {
@@ -100,6 +111,19 @@ func main() {
 		slog.Error("Failed to create GitHub client", "error", err)
 		os.Exit(1)
 	}
+
+	// Get token for prx client
+	token, err := client.Token(ctx)
+	if err != nil {
+		slog.Error("Failed to get GitHub token for prx client", "error", err)
+		os.Exit(1)
+	}
+
+	// Create prx client for enhanced PR data (includes CI status)
+	prxClient := prx.NewClient(token, prx.WithLogger(logger))
+
+	// Wrap prx client to satisfy interface
+	client.SetPrxClient(&prxClientWrapper{client: prxClient})
 
 	// Create reviewer finder
 	finderCfg := reviewer.Config{
@@ -246,6 +270,11 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 		return false
 	}
 
+	// Check CI/test status and apply delays
+	if !b.isPRReadyForReview(pr) {
+		return false
+	}
+
 	// Check PR age constraints
 	if !b.isPRReady(pr) {
 		slog.Debug("Skipping PR outside time window", "pr", pr.Number, "repo", pr.Repository)
@@ -294,6 +323,75 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 		"pr", pr.Number,
 		"repo", pr.Repository,
 		"reviewers", reviewers)
+	return true
+}
+
+// isPRReadyForReview checks if a PR is ready for reviewer assignment based on CI/test status.
+// Returns false if tests are pending (wait 20 min) or failing (wait 90 min).
+// Also enforces a minimum 2 minute wait since last update.
+func (*Bot) isPRReadyForReview(pr *types.PullRequest) bool {
+	timeSinceUpdate := time.Since(pr.UpdatedAt)
+
+	// Always wait at least 2 minutes since last update before assigning reviewers
+	const minWaitTime = 2 * time.Minute
+	if timeSinceUpdate < minWaitTime {
+		slog.Debug("Skipping PR - waiting for minimum time since last update",
+			"pr", pr.Number,
+			"repo", pr.Repository,
+			"time_since_update", timeSinceUpdate.Round(time.Second),
+			"wait_remaining", (minWaitTime - timeSinceUpdate).Round(time.Second))
+		return false
+	}
+
+	switch pr.TestState {
+	case "failing":
+		// Wait 90 minutes after last update if tests are failing
+		if timeSinceUpdate < 90*time.Minute {
+			slog.Debug("Skipping PR with failing tests - waiting for fixes",
+				"pr", pr.Number,
+				"repo", pr.Repository,
+				"test_state", pr.TestState,
+				"time_since_update", timeSinceUpdate.Round(time.Minute),
+				"wait_remaining", (90*time.Minute - timeSinceUpdate).Round(time.Minute))
+			return false
+		}
+		slog.Info("Assigning reviewers to PR with failing tests after 90 minute grace period",
+			"pr", pr.Number,
+			"repo", pr.Repository,
+			"test_state", pr.TestState,
+			"time_since_update", timeSinceUpdate.Round(time.Minute))
+
+	case "pending", "queued", "running":
+		// Wait 20 minutes after last update if tests are pending
+		if timeSinceUpdate < 20*time.Minute {
+			slog.Debug("Skipping PR with pending tests - waiting for completion",
+				"pr", pr.Number,
+				"repo", pr.Repository,
+				"test_state", pr.TestState,
+				"time_since_update", timeSinceUpdate.Round(time.Minute),
+				"wait_remaining", (20*time.Minute - timeSinceUpdate).Round(time.Minute))
+			return false
+		}
+		slog.Info("Assigning reviewers to PR with pending tests after 20 minute grace period",
+			"pr", pr.Number,
+			"repo", pr.Repository,
+			"test_state", pr.TestState,
+			"time_since_update", timeSinceUpdate.Round(time.Minute))
+
+	case "passing", "":
+		// No delay for passing or unknown test states
+		slog.Debug("PR has passing or no CI checks",
+			"pr", pr.Number,
+			"repo", pr.Repository,
+			"test_state", pr.TestState)
+	default:
+		// Unknown test state - proceed with review assignment
+		slog.Debug("PR has unknown test state",
+			"pr", pr.Number,
+			"repo", pr.Repository,
+			"test_state", pr.TestState)
+	}
+
 	return true
 }
 

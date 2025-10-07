@@ -981,7 +981,7 @@ func TestLargeScaleMultiDirectoryPR(t *testing.T) {
 	// Simulate: 386 base score, 20 open PRs → 200 penalty capped at 193 (50%)
 	baseScore := 386
 	openPRs := 20
-	rawPenalty := openPRs * 10 // 200
+	rawPenalty := openPRs * 10  // 200
 	maxPenalty := baseScore / 2 // 193
 	expectedPenalty := rawPenalty
 	if expectedPenalty > maxPenalty {

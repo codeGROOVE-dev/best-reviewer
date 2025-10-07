@@ -19,6 +19,16 @@ const (
 
 // PullRequest fetches a single pull request.
 func (c *Client) PullRequest(ctx context.Context, owner, repo string, prNumber int) (*types.PullRequest, error) {
+	// Use prx if available for enhanced PR data including test status
+	if c.prxClient != nil {
+		// Use current time as reference for caching - prx will intelligently cache based on PR's actual updated_at
+		prxData, err := c.prxClient.PullRequestWithReferenceTime(ctx, owner, repo, prNumber, time.Now())
+		if err != nil {
+			slog.Warn("Failed to fetch PR via prx, falling back to REST API", "error", err, "owner", owner, "repo", repo, "pr", prNumber)
+			return c.pullRequestWithUpdatedAt(ctx, owner, repo, prNumber, nil)
+		}
+		return c.convertPrxToPullRequest(ctx, owner, repo, prxData)
+	}
 	return c.pullRequestWithUpdatedAt(ctx, owner, repo, prNumber, nil)
 }
 
@@ -340,4 +350,85 @@ func (c *Client) FilePatch(ctx context.Context, owner, repo string, prNumber int
 	}
 
 	return "", fmt.Errorf("file %s not found in PR %d", filename, prNumber)
+}
+
+// convertPrxToPullRequest converts prx.PullRequestData to types.PullRequest.
+func (c *Client) convertPrxToPullRequest(ctx context.Context, owner, repo string, prxData any) (*types.PullRequest, error) {
+	// Type assert to get the prx data structure
+	// We use interface{} to avoid import cycles, so we need to use reflection or type assertion
+	type prxPullRequest struct {
+		Number             int
+		Title              string
+		State              string
+		Draft              bool
+		Author             string
+		TestState          string
+		CreatedAt          time.Time
+		UpdatedAt          time.Time
+		HeadSHA            string
+		RequestedReviewers []string
+		Assignees          []string
+	}
+
+	type prxPullRequestData struct {
+		PullRequest prxPullRequest
+	}
+
+	// Convert via JSON marshaling/unmarshaling to handle the interface{}
+	jsonData, err := json.Marshal(prxData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal prx data: %w", err)
+	}
+
+	var data prxPullRequestData
+	if err := json.Unmarshal(jsonData, &data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal prx data: %w", err)
+	}
+
+	pr := &types.PullRequest{
+		Number:     data.PullRequest.Number,
+		Title:      data.PullRequest.Title,
+		State:      data.PullRequest.State,
+		Draft:      data.PullRequest.Draft,
+		Author:     data.PullRequest.Author,
+		Repository: repo,
+		Owner:      owner,
+		CreatedAt:  data.PullRequest.CreatedAt,
+		UpdatedAt:  data.PullRequest.UpdatedAt,
+		TestState:  data.PullRequest.TestState,
+		Reviewers:  data.PullRequest.RequestedReviewers,
+		Assignees:  data.PullRequest.Assignees,
+		// These fields will be populated by separate API calls if needed
+		LastCommit:   time.Time{},
+		LastReview:   time.Time{},
+		ChangedFiles: []types.ChangedFile{},
+	}
+
+	// Fetch changed files separately if needed
+	changedFiles, err := c.ChangedFiles(ctx, owner, repo, data.PullRequest.Number)
+	if err != nil {
+		slog.Warn("Failed to fetch changed files for prx PR", "error", err, "owner", owner, "repo", repo, "pr", data.PullRequest.Number)
+	} else {
+		pr.ChangedFiles = changedFiles
+	}
+
+	// Fetch last commit time separately if we have the SHA
+	if data.PullRequest.HeadSHA != "" {
+		lastCommit, err := c.lastCommitTime(ctx, owner, repo, data.PullRequest.HeadSHA)
+		if err != nil {
+			slog.Warn("Failed to fetch last commit time for prx PR", "error", err, "owner", owner, "repo", repo, "pr", data.PullRequest.Number)
+		} else {
+			pr.LastCommit = lastCommit
+		}
+	}
+
+	// Fetch last review time separately
+	lastReview, err := c.lastReviewTime(ctx, owner, repo, data.PullRequest.Number)
+	if err != nil {
+		slog.Warn("Failed to fetch last review time for prx PR", "error", err, "owner", owner, "repo", repo, "pr", data.PullRequest.Number)
+	} else {
+		pr.LastReview = lastReview
+	}
+
+	return pr, nil
 }

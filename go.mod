@@ -10,4 +10,7 @@ require (
 	github.com/codeGROOVE-dev/sprinkler v0.0.0-20251007014926-7fed60b70e75
 )
 
-require golang.org/x/net v0.44.0 // indirect
+require (
+	github.com/codeGROOVE-dev/prx v0.0.0-20251001143458-17e6b58fb46c // indirect
+	golang.org/x/net v0.44.0 // indirect
+)

@@ -28,13 +28,16 @@ type Client struct {
 	installationIDs    map[string]int
 	installationTypes  map[string]string
 	userCache          *UserCache
-	appID              string
-	token              string
-	privateKeyPath     string
-	currentOrg         string
-	privateKeyContent  []byte
-	tokenMutex         sync.RWMutex
-	isAppAuth          bool
+	prxClient          interface { // prx.Client interface to avoid import cycle
+		PullRequestWithReferenceTime(ctx context.Context, owner, repo string, prNumber int, referenceTime time.Time) (any, error)
+	}
+	appID             string
+	token             string
+	privateKeyPath    string
+	currentOrg        string
+	privateKeyContent []byte
+	tokenMutex        sync.RWMutex
+	isAppAuth         bool
 }
 
 // Config holds configuration for creating a new GitHub client.
@@ -63,18 +66,19 @@ func (c *Client) SetCurrentOrg(org string) {
 	c.currentOrg = org
 }
 
+// SetPrxClient sets the prx client for enhanced PR data fetching.
+func (c *Client) SetPrxClient(prxClient interface {
+	PullRequestWithReferenceTime(ctx context.Context, owner, repo string, prNumber int, referenceTime time.Time) (any, error)
+},
+) {
+	c.prxClient = prxClient
+}
+
 // IsUserAccount checks if the given account is a user account (not an organization).
 func (c *Client) IsUserAccount(account string) bool {
 	c.tokenMutex.RLock()
 	defer c.tokenMutex.RUnlock()
 	return c.installationTypes[account] == "User"
-}
-
-// getToken returns the current authentication token (JWT for app auth, PAT otherwise).
-func (c *Client) getToken() string {
-	c.tokenMutex.RLock()
-	defer c.tokenMutex.RUnlock()
-	return c.token
 }
 
 // Token returns the current GitHub token for external use (e.g., sprinkler).
@@ -84,7 +88,9 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 	if c.isAppAuth && c.currentOrg != "" {
 		return c.getInstallationToken(ctx, c.currentOrg)
 	}
-	return c.getToken(), nil
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.token, nil
 }
 
 // drainAndCloseBody drains and closes an HTTP response body to prevent resource leaks.
@@ -238,14 +244,17 @@ func (c *Client) AddReviewers(ctx context.Context, owner, repo string, prNumber 
 		"reviewers": reviewers,
 	}
 
-	resp, err := c.makeRequest(ctx, "POST", url, payload)
+	resp, err := c.makeRequest(ctx, "POST", url, payload) //nolint:bodyclose // body is closed via defer drainAndCloseBody
 	if err != nil {
 		return fmt.Errorf("failed to add reviewers: %w", err)
 	}
 	defer drainAndCloseBody(resp.Body)
 
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to add reviewers: status %d (could not read body: %w)", resp.StatusCode, err)
+		}
 		return fmt.Errorf("failed to add reviewers: status %d: %s", resp.StatusCode, string(body))
 	}
 

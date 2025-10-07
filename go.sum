@@ -1,5 +1,7 @@
 github.com/codeGROOVE-dev/gsm v0.0.0-20251006212002-b898800f0bbb h1:wFVF6xrohWXYCbozb0RBjdnD4E6n+AWyndXumTVdQUg=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251006212002-b898800f0bbb/go.mod h1:KV+w19ubP32PxZPE1hOtlCpTaNpF0Bpb32w5djO8UTg=
+github.com/codeGROOVE-dev/prx v0.0.0-20251001143458-17e6b58fb46c h1:/rrjFoqwFqKNzc1f14vQt6QJ9U5tQ4Uh6U8hgixkSqw=
+github.com/codeGROOVE-dev/prx v0.0.0-20251001143458-17e6b58fb46c/go.mod h1:7qLbi18baOyS8yO/6/64SBIqtyzSzLFdsDST15NPH3w=
 github.com/codeGROOVE-dev/retry v1.2.0 h1:xYpYPX2PQZmdHwuiQAGGzsBm392xIMl4nfMEFApQnu8=
 github.com/codeGROOVE-dev/retry v1.2.0/go.mod h1:8OgefgV1XP7lzX2PdKlCXILsYKuz6b4ZpHa/20iLi8E=
 github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001154245-068712aa969d h1:tQX67dAzyWVAaNe0EhYpj/AmWZo1Wwhaah6KVj7M3qs=
