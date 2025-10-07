@@ -267,7 +267,12 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 	}
 
 	// Check PR age constraints
-	if !b.isPRReady(pr) {
+	lastActivity := pr.LastCommit
+	if pr.LastReview.After(lastActivity) {
+		lastActivity = pr.LastReview
+	}
+	timeSinceActivity := time.Since(lastActivity)
+	if timeSinceActivity < b.minOpenTime || timeSinceActivity > b.maxOpenTime {
 		slog.Debug("Skipping PR outside time window", "pr", pr.Number, "repo", pr.Repository)
 		return false
 	}
@@ -302,7 +307,7 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 		return true
 	}
 
-	if err := b.assignReviewers(ctx, pr, reviewers); err != nil {
+	if err := b.client.AddReviewers(ctx, pr.Owner, pr.Repository, pr.Number, reviewers); err != nil {
 		slog.Error("Failed to assign reviewers",
 			"pr", pr.Number,
 			"repo", pr.Repository,
@@ -384,22 +389,6 @@ func (*Bot) isPRReadyForReview(pr *types.PullRequest) bool {
 	}
 
 	return true
-}
-
-// isPRReady checks if a PR is ready for reviewer assignment based on age constraints.
-func (b *Bot) isPRReady(pr *types.PullRequest) bool {
-	lastActivity := pr.LastCommit
-	if pr.LastReview.After(lastActivity) {
-		lastActivity = pr.LastReview
-	}
-
-	timeSinceActivity := time.Since(lastActivity)
-	return timeSinceActivity >= b.minOpenTime && timeSinceActivity <= b.maxOpenTime
-}
-
-// assignReviewers assigns reviewers to a PR.
-func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
-	return b.client.AddReviewers(ctx, pr.Owner, pr.Repository, pr.Number, reviewers)
 }
 
 // runServeMode runs the bot in server mode with periodic execution.
