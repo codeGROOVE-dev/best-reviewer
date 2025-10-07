@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/cache"
@@ -146,6 +149,93 @@ func (c *Client) pullRequestWithUpdatedAt(
 	c.cachePR(pr)
 
 	return pr, nil
+}
+
+// OpenPullRequestsForOrg fetches all open pull requests across all repositories in an organization.
+func (c *Client) OpenPullRequestsForOrg(ctx context.Context, org string) ([]*types.PullRequest, error) {
+	// Use GitHub search API to find all open PRs in the org without reviewers
+	// review:none filters to PRs that don't have any requested reviewers
+	query := fmt.Sprintf("is:pr is:open org:%s review:none", org)
+	slog.Info("Searching for open PRs without reviewers across organization", "org", org)
+
+	allPRs := make([]*types.PullRequest, 0, 100) // Pre-allocate for typical case
+	page := 1
+	perPage := 100
+
+	for {
+		encodedQuery := url.QueryEscape(query)
+		apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=%d&page=%d", encodedQuery, perPage, page)
+
+		resp, err := c.makeRequest(ctx, "GET", apiURL, nil) //nolint:bodyclose // body is closed immediately, not deferred
+		if err != nil {
+			return nil, fmt.Errorf("failed to search PRs: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			drainAndCloseBody(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to search PRs: status %d (could not read body: %w)", resp.StatusCode, err)
+			}
+			return nil, fmt.Errorf("failed to search PRs: status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var searchResult struct {
+			Items []struct {
+				Number      int    `json:"number"`
+				Title       string `json:"title"`
+				State       string `json:"state"`
+				Draft       bool   `json:"draft"`
+				UpdatedAt   string `json:"updated_at"`
+				PullRequest struct {
+					URL string `json:"url"`
+				} `json:"pull_request"`
+				RepositoryURL string `json:"repository_url"`
+			} `json:"items"`
+			TotalCount int `json:"total_count"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&searchResult); err != nil {
+			drainAndCloseBody(resp.Body)
+			return nil, fmt.Errorf("failed to decode search results: %w", err)
+		}
+		drainAndCloseBody(resp.Body)
+
+		slog.Debug("Search results page", "org", org, "page", page, "items", len(searchResult.Items), "total_count", searchResult.TotalCount)
+
+		if len(searchResult.Items) == 0 {
+			break
+		}
+
+		// For each PR, we need to fetch full details
+		for _, item := range searchResult.Items {
+			// Extract repo from repository_url: https://api.github.com/repos/owner/repo
+			parts := strings.Split(item.RepositoryURL, "/")
+			if len(parts) < 2 {
+				slog.Warn("Invalid repository URL", "url", item.RepositoryURL, "org", org)
+				continue
+			}
+			repo := parts[len(parts)-1]
+
+			// Fetch full PR details (this uses prx which has caching and retry)
+			pr, err := c.PullRequest(ctx, org, repo, item.Number)
+			if err != nil {
+				slog.Warn("Failed to fetch PR details", "org", org, "repo", repo, "pr", item.Number, "error", err)
+				continue
+			}
+
+			allPRs = append(allPRs, pr)
+		}
+
+		if len(searchResult.Items) < perPage {
+			break
+		}
+
+		page++
+	}
+
+	slog.Info("Found open PRs for org", "org", org, "count", len(allPRs))
+	return allPRs, nil
 }
 
 // OpenPullRequests fetches all open pull requests for a repository.

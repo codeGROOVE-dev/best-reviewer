@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -221,35 +220,27 @@ func (b *Bot) processSinglePR(ctx context.Context, owner, repo string, prNumber 
 
 // processOrg processes all PRs for a single organization.
 func (b *Bot) processOrg(ctx context.Context, org string) (processed, assigned, skipped int) {
-	// Get all repositories for the org
-	repos, err := b.listOrgRepos(ctx, org)
+	// Get all open PRs across all repos in the org using search API
+	prs, err := b.client.OpenPullRequestsForOrg(ctx, org)
 	if err != nil {
-		slog.Warn("Failed to list repositories for org", "org", org, "error", err)
+		slog.Warn("Failed to get PRs for org", "org", org, "error", err)
 		return 0, 0, 0
 	}
 
-	for _, repo := range repos {
-		prs, err := b.client.OpenPullRequests(ctx, org, repo)
-		if err != nil {
-			slog.Warn("Failed to get PRs", "org", org, "repo", repo, "error", err)
-			continue
+	for _, pr := range prs {
+		processed++
+		if b.metrics != nil {
+			b.metrics.RecordPRSeen(org, pr.Repository, pr.Number)
 		}
 
-		for _, pr := range prs {
-			processed++
+		wasAssigned := b.processPR(ctx, pr)
+		if wasAssigned {
+			assigned++
 			if b.metrics != nil {
-				b.metrics.RecordPRSeen(org, repo, pr.Number)
+				b.metrics.RecordPRModified(org, pr.Repository, pr.Number)
 			}
-
-			wasAssigned := b.processPR(ctx, pr)
-			if wasAssigned {
-				assigned++
-				if b.metrics != nil {
-					b.metrics.RecordPRModified(org, repo, pr.Number)
-				}
-			} else {
-				skipped++
-			}
+		} else {
+			skipped++
 		}
 	}
 
@@ -409,15 +400,6 @@ func (b *Bot) isPRReady(pr *types.PullRequest) bool {
 // assignReviewers assigns reviewers to a PR.
 func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
 	return b.client.AddReviewers(ctx, pr.Owner, pr.Repository, pr.Number, reviewers)
-}
-
-// listOrgRepos lists all repositories for an organization.
-func (*Bot) listOrgRepos(ctx context.Context, org string) ([]string, error) {
-	// This would need to be implemented in the github package
-	// For now, return empty list
-	_ = ctx
-	_ = org
-	return []string{}, errors.New("not implemented - needs github.Client.ListOrgRepos method")
 }
 
 // runServeMode runs the bot in server mode with periodic execution.
