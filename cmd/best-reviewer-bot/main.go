@@ -26,7 +26,7 @@ var (
 	// Behavior flags.
 	loopDelay   = flag.Duration("loop-delay", 20*time.Minute, "Loop delay between polling cycles (default: 20m)")
 	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
-	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
+	minOpenTime = flag.Duration("min-age", 0, "Minimum time since last activity for PR assignment")
 	maxOpenTime = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
 
 	prCountCache = flag.Duration("pr-count-cache", 6*time.Hour, "Cache duration for PR count queries")
@@ -264,10 +264,14 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 		return false
 	}
 
-	// Assign reviewers
-	reviewers := make([]string, 0, len(candidates))
-	for _, c := range candidates {
-		reviewers = append(reviewers, c.Username)
+	// Assign top 2 reviewers only
+	maxReviewers := 2
+	if len(candidates) < maxReviewers {
+		maxReviewers = len(candidates)
+	}
+	reviewers := make([]string, 0, maxReviewers)
+	for i := 0; i < maxReviewers; i++ {
+		reviewers = append(reviewers, candidates[i].Username)
 	}
 
 	if b.dryRun {
@@ -305,21 +309,8 @@ func (b *Bot) isPRReady(pr *types.PullRequest) bool {
 }
 
 // assignReviewers assigns reviewers to a PR.
-func (*Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers",
-		pr.Owner, pr.Repository, pr.Number)
-
-	payload := map[string]any{
-		"reviewers": reviewers,
-	}
-
-	// This would need to be exposed from the github package
-	// For now, using a simplified approach
-	_ = url
-	_ = payload
-	_ = ctx
-
-	return errors.New("not implemented - needs github.Client.AddReviewers method")
+func (b *Bot) assignReviewers(ctx context.Context, pr *types.PullRequest, reviewers []string) error {
+	return b.client.AddReviewers(ctx, pr.Owner, pr.Repository, pr.Number, reviewers)
 }
 
 // listOrgRepos lists all repositories for an organization.

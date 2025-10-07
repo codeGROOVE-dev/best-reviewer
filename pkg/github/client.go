@@ -229,3 +229,26 @@ func retryWithBackoff(ctx context.Context, operation string, fn func() error) er
 		}),
 	)
 }
+
+// AddReviewers adds reviewers to a pull request.
+func (c *Client) AddReviewers(ctx context.Context, owner, repo string, prNumber int, reviewers []string) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, prNumber)
+
+	payload := map[string]any{
+		"reviewers": reviewers,
+	}
+
+	resp, err := c.makeRequest(ctx, "POST", url, payload)
+	if err != nil {
+		return fmt.Errorf("failed to add reviewers: %w", err)
+	}
+	defer drainAndCloseBody(resp.Body)
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to add reviewers: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	slog.Info("Added reviewers to PR", "owner", owner, "repo", repo, "pr", prNumber, "reviewers", reviewers)
+	return nil
+}
