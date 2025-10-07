@@ -7,7 +7,7 @@
 set -eux -o pipefail
 test -n "${1:-}" && cd "$1"
 
-PROJECT=${GCP_PROJECT:=chat-bot-army}
+PROJECT=${GCP_PROJECT:=github-bot-army}
 REGISTRY="${PROJECT}"
 REGION="us-central1"
 

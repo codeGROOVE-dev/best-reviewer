@@ -21,6 +21,10 @@ $(BEST_REVIEWER_BOT_BIN):
 clean:
 	rm -rf $(OUT_DIR)
 
+.PHONY: deploy
+deploy:
+	./hacks/deploy.sh ./cmd/best-reviewer-bot
+
 # BEGIN: lint-install /Users/t/dev/r2r/github-smart-reviewer-bot/
 # http://github.com/codeGROOVE-dev/lint-install
 

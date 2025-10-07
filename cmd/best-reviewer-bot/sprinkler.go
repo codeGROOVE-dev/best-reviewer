@@ -26,11 +26,9 @@ const (
 type sprinklerMonitor struct {
 	bot             *Bot
 	client          *client.Client
-	cancel          context.CancelFunc
 	eventChan       chan string          // Channel for PR URLs that need processing
 	lastEventMap    map[string]time.Time // Track last event per URL to dedupe
 	lastConnectedAt time.Time            // Last successful connection time
-	token           string               // Installation token for this org
 	org             string               // Organization this monitor is for
 	mu              sync.RWMutex
 	isRunning       bool
@@ -38,16 +36,22 @@ type sprinklerMonitor struct {
 }
 
 // newSprinklerMonitor creates a new sprinkler monitor for a specific org.
-func newSprinklerMonitor(bot *Bot, token, org string) *sprinklerMonitor {
-	_, cancel := context.WithCancel(context.Background())
+func newSprinklerMonitor(bot *Bot, org string) *sprinklerMonitor {
 	return &sprinklerMonitor{
 		bot:          bot,
-		token:        token,
 		org:          org,
-		cancel:       cancel,
 		eventChan:    make(chan string, eventChannelSize),
 		lastEventMap: make(map[string]time.Time),
 	}
+}
+
+// getToken retrieves a fresh installation token for this org.
+func (sm *sprinklerMonitor) getToken(ctx context.Context) (string, error) {
+	sm.bot.client.SetCurrentOrg(sm.org)
+	defer sm.bot.client.SetCurrentOrg("")
+
+	// The client will automatically refresh the token if needed
+	return sm.bot.client.Token(ctx)
 }
 
 // start begins monitoring for PR events for this org.
@@ -62,9 +66,15 @@ func (sm *sprinklerMonitor) start(ctx context.Context) error {
 
 	slog.Info("Starting event monitor for org", "component", "sprinkler", "org", sm.org)
 
+	// Get initial token
+	token, err := sm.getToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get initial token: %w", err)
+	}
+
 	config := client.Config{
 		ServerURL:      "wss://" + client.DefaultServerAddress + "/ws",
-		Token:          sm.token,
+		Token:          token,
 		Organization:   sm.org, // Monitor only this org
 		EventTypes:     []string{"pull_request"},
 		UserEventsOnly: false,
@@ -75,14 +85,14 @@ func (sm *sprinklerMonitor) start(ctx context.Context) error {
 			sm.isConnected = true
 			sm.lastConnectedAt = time.Now()
 			sm.mu.Unlock()
-			slog.Info("WebSocket connected", "component", "sprinkler")
+			slog.Info("WebSocket connected", "component", "sprinkler", "org", sm.org)
 		},
 		OnDisconnect: func(err error) {
 			sm.mu.Lock()
 			sm.isConnected = false
 			sm.mu.Unlock()
 			if err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("WebSocket disconnected", "component", "sprinkler", "error", err)
+				slog.Warn("WebSocket disconnected", "component", "sprinkler", "org", sm.org, "error", err)
 			}
 		},
 		OnEvent: func(event client.Event) {
@@ -99,16 +109,16 @@ func (sm *sprinklerMonitor) start(ctx context.Context) error {
 	sm.client = wsClient
 	sm.isRunning = true
 
-	slog.Info("Starting event processor goroutine", "component", "sprinkler")
+	slog.Info("Starting event processor goroutine", "component", "sprinkler", "org", sm.org)
 	// Start event processor
 	go sm.processEvents(ctx)
 
-	slog.Info("Starting WebSocket client goroutine", "component", "sprinkler")
+	slog.Info("Starting WebSocket client goroutine", "component", "sprinkler", "org", sm.org)
 	// Start WebSocket client with error recovery
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("WebSocket goroutine panic", "component", "sprinkler", "panic", r)
+				slog.Error("WebSocket goroutine panic", "component", "sprinkler", "org", sm.org, "panic", r)
 				sm.mu.Lock()
 				sm.isRunning = false
 				sm.mu.Unlock()
@@ -117,16 +127,16 @@ func (sm *sprinklerMonitor) start(ctx context.Context) error {
 
 		startTime := time.Now()
 		if err := wsClient.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error("WebSocket client error", "component", "sprinkler", "uptime", time.Since(startTime).Round(time.Second), "error", err)
+			slog.Error("WebSocket client error", "component", "sprinkler", "org", sm.org, "uptime", time.Since(startTime).Round(time.Second), "error", err)
 			sm.mu.Lock()
 			sm.isRunning = false
 			sm.mu.Unlock()
 		} else {
-			slog.Info("WebSocket client stopped gracefully", "component", "sprinkler", "uptime", time.Since(startTime).Round(time.Second))
+			slog.Info("WebSocket client stopped gracefully", "component", "sprinkler", "org", sm.org, "uptime", time.Since(startTime).Round(time.Second))
 		}
 	}()
 
-	slog.Info("Event monitor started successfully", "component", "sprinkler")
+	slog.Info("Event monitor started successfully", "component", "sprinkler", "org", sm.org)
 	return nil
 }
 
@@ -252,9 +262,13 @@ func (sm *sprinklerMonitor) stop() {
 		return
 	}
 
-	slog.Info("Stopping event monitor", "component", "sprinkler")
-	sm.cancel()
+	slog.Info("Stopping event monitor", "component", "sprinkler", "org", sm.org)
 	sm.isRunning = false
+
+	// Close the client to stop the WebSocket connection
+	if sm.client != nil {
+		sm.client.Stop()
+	}
 }
 
 // parsePRURL extracts owner, repo, and PR number from URL.

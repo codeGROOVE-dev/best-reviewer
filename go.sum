@@ -1,7 +1,13 @@
+github.com/codeGROOVE-dev/gsm v0.0.0-20251006212002-b898800f0bbb h1:wFVF6xrohWXYCbozb0RBjdnD4E6n+AWyndXumTVdQUg=
+github.com/codeGROOVE-dev/gsm v0.0.0-20251006212002-b898800f0bbb/go.mod h1:KV+w19ubP32PxZPE1hOtlCpTaNpF0Bpb32w5djO8UTg=
 github.com/codeGROOVE-dev/retry v1.2.0 h1:xYpYPX2PQZmdHwuiQAGGzsBm392xIMl4nfMEFApQnu8=
 github.com/codeGROOVE-dev/retry v1.2.0/go.mod h1:8OgefgV1XP7lzX2PdKlCXILsYKuz6b4ZpHa/20iLi8E=
 github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001154245-068712aa969d h1:tQX67dAzyWVAaNe0EhYpj/AmWZo1Wwhaah6KVj7M3qs=
 github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001154245-068712aa969d/go.mod h1:RZ/Te7HkY5upHQlnmf3kV4GHVM0R8AK3U+yPItCZAoQ=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251006223507-aa831d9c3279 h1:38sj/xvPrpSZxEzMfe7Ed4BaryuPioOYn4QlGNjqflE=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251006223507-aa831d9c3279/go.mod h1:RZ/Te7HkY5upHQlnmf3kV4GHVM0R8AK3U+yPItCZAoQ=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251007014926-7fed60b70e75 h1:I+gBQZoB2QCiV++lNOxUNMiNvyfeyhN7oy89U/hTjtw=
+github.com/codeGROOVE-dev/sprinkler v0.0.0-20251007014926-7fed60b70e75/go.mod h1:RZ/Te7HkY5upHQlnmf3kV4GHVM0R8AK3U+yPItCZAoQ=
 github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
 github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 golang.org/x/net v0.44.0 h1:evd8IRDyfNBMBTTY5XRF1vaZlD+EmWx6x8PkhR04H/I=

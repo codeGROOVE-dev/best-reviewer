@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/codeGROOVE-dev/best-reviewer/pkg/cache"
+	"github.com/codeGROOVE-dev/gsm"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -71,9 +72,9 @@ func generateJWT(appID string, privateKey []byte) (string, error) {
 }
 
 // newAppAuthClient creates a GitHub client with App authentication.
-func newAppAuthClient(_ context.Context, appID, appKeyPath string, httpTimeout time.Duration, cacheTTL time.Duration, cacheDir string) (*Client, error) {
+func newAppAuthClient(ctx context.Context, appID, appKeyPath string, httpTimeout time.Duration, cacheTTL time.Duration, cacheDir string) (*Client, error) {
 	// Resolve credentials from flags or environment variables
-	creds, err := resolveAppCredentials(appID, appKeyPath)
+	creds, err := resolveAppCredentials(ctx, appID, appKeyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +148,7 @@ type appCredentials struct {
 }
 
 // resolveAppCredentials resolves app credentials from flags or environment variables.
-func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
+func resolveAppCredentials(ctx context.Context, appID, appKeyPath string) (*appCredentials, error) {
 	// Use provided flags or fall back to environment variables
 	if appID == "" {
 		appID = os.Getenv("GITHUB_APP_ID")
@@ -157,21 +158,16 @@ func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
 	if appKeyPath != "" {
 		slog.Info("Using private key file path from command line", "component", "auth", "path", appKeyPath)
 	} else {
-		// Check for private key content first (more secure)
-		if keyContent := os.Getenv("GITHUB_APP_KEY"); keyContent != "" {
+		// Try gsm.Secret first for secure secret retrieval
+		if keyContent, err := gsm.Secret(ctx, "GITHUB_APP_KEY"); err == nil && keyContent != "" {
 			privateKeyContent = []byte(keyContent)
-			slog.Info("Using GITHUB_APP_KEY environment variable", "component", "auth", "bytes", len(privateKeyContent))
-			// Clear appKeyPath to ensure we don't try to read from file
+			slog.Info("Using GITHUB_APP_KEY from Google Secret Manager", "component", "auth", "bytes", len(privateKeyContent))
 			appKeyPath = ""
 		} else {
-			// Fall back to key file path only if no content is provided
+			// Fall back to key file path
 			appKeyPath = os.Getenv("GITHUB_APP_KEY_PATH")
-			if appKeyPath == "" {
-				// Also check the old environment variable for backward compatibility
-				appKeyPath = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
-			}
 			if appKeyPath != "" {
-				slog.Info("Using private key file path", "component", "auth", "path", appKeyPath)
+				slog.Info("Using private key file path from GITHUB_APP_KEY_PATH", "component", "auth", "path", appKeyPath)
 			}
 		}
 	}
@@ -182,7 +178,7 @@ func resolveAppCredentials(appID, appKeyPath string) (*appCredentials, error) {
 	}
 	if len(privateKeyContent) == 0 && appKeyPath == "" {
 		return nil, errors.New("GitHub App private key is required. " +
-			"Use --app-key-path flag, set GITHUB_APP_KEY environment variable (key content), " +
+			"Use --app-key-path flag, set GITHUB_APP_KEY in Google Secret Manager, " +
 			"or set GITHUB_APP_KEY_PATH environment variable (file path)")
 	}
 
@@ -238,7 +234,7 @@ func readPrivateKeyFile(keyPath string) ([]byte, error) {
 	// Validate and clean the private key path to prevent path traversal
 	cleanPath := filepath.Clean(keyPath)
 	if !filepath.IsAbs(cleanPath) {
-		return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be an absolute path")
+		return nil, errors.New("private key path must be an absolute path")
 	}
 
 	// Verify file exists and has appropriate permissions
@@ -247,7 +243,7 @@ func readPrivateKeyFile(keyPath string) ([]byte, error) {
 		return nil, fmt.Errorf("cannot access private key file: %w", err)
 	}
 	if fileInfo.IsDir() {
-		return nil, errors.New("GITHUB_APP_PRIVATE_KEY_PATH must be a file, not a directory")
+		return nil, errors.New("private key path must be a file, not a directory")
 	}
 
 	// Check file permissions - must be exactly 0600 or 0400
@@ -419,51 +415,57 @@ func (c *Client) getInstallationToken(ctx context.Context, org string) (string, 
 		return "", fmt.Errorf("no installation ID found for organization %s (is the app installed?)", org)
 	}
 
-	// Create installation access token
+	// Create installation access token with retry logic
 	slog.Info("Creating installation access token for org", "component", "auth", "org", org, "installation_id", installationID)
 	apiURL := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
-
-	// Use JWT for this request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, http.NoBody)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		slog.Error("Failed to request installation token for org", "component", "auth", "org", org, "error", err)
-		return "", fmt.Errorf("failed to get installation token: %w", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("Failed to close response body", "error", err)
-		}
-	}()
-
-	if resp.StatusCode != http.StatusCreated {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			slog.Error("Failed to read error response body for org", "component", "auth", "org", org, "error", err)
-			return "", fmt.Errorf("failed to create installation token (status %d) and read error: %w", resp.StatusCode, err)
-		}
-		slog.Error("GitHub API error creating installation token for org", "component", "auth", "org", org, "status", resp.StatusCode, "body", string(body))
-		return "", fmt.Errorf("failed to create installation token (status %d): %s", resp.StatusCode, string(body))
-	}
 
 	var tokenResp struct {
 		ExpiresAt time.Time `json:"expires_at"`
 		Token     string    `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		slog.Error("Failed to decode installation token response for org", "component", "auth", "org", org, "error", err)
-		return "", fmt.Errorf("failed to decode token response: %w", err)
-	}
 
-	if tokenResp.Token == "" {
-		slog.Error("Received empty installation token for org", "component", "auth", "org", org)
-		return "", errors.New("received empty installation token")
+	err := retryWithBackoff(ctx, fmt.Sprintf("create installation token for org %s", org), func() error {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, http.NoBody)
+		if reqErr != nil {
+			return fmt.Errorf("failed to create request: %w", reqErr)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+		resp, httpErr := c.httpClient.Do(req)
+		if httpErr != nil {
+			return fmt.Errorf("failed to get installation token: %w", httpErr)
+		}
+		defer func() {
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				slog.Warn("Failed to close response body", "error", closeErr)
+			}
+		}()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				slog.Error("Failed to read error response body for org", "component", "auth", "org", org, "error", readErr)
+				return fmt.Errorf("failed to create installation token (status %d) and read error: %w", resp.StatusCode, readErr)
+			}
+			slog.Error("GitHub API error creating installation token for org", "component", "auth", "org", org, "status", resp.StatusCode, "body", string(body))
+			return fmt.Errorf("failed to create installation token (status %d): %s", resp.StatusCode, string(body))
+		}
+
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&tokenResp); decodeErr != nil {
+			slog.Error("Failed to decode installation token response for org", "component", "auth", "org", org, "error", decodeErr)
+			return fmt.Errorf("failed to decode token response: %w", decodeErr)
+		}
+
+		if tokenResp.Token == "" {
+			slog.Error("Received empty installation token for org", "component", "auth", "org", org)
+			return errors.New("received empty installation token")
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 
 	// Cache the token (expire 5 minutes before actual expiry for safety)

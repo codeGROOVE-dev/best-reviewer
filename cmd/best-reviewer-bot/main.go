@@ -24,8 +24,7 @@ var (
 	appKeyPath = flag.String("app-key-path", "", "Path to GitHub App private key file")
 
 	// Behavior flags.
-	serve       = flag.Bool("serve", false, "Run in server mode with health endpoint")
-	loopDelay   = flag.Duration("loop-delay", 5*time.Minute, "Loop delay in serve mode (default: 5m)")
+	loopDelay   = flag.Duration("loop-delay", 20*time.Minute, "Loop delay between polling cycles (default: 20m)")
 	dryRun      = flag.Bool("dry-run", false, "Run in dry-run mode (no actual reviewer assignments)")
 	minOpenTime = flag.Duration("min-age", 1*time.Hour, "Minimum time since last activity for PR assignment")
 	maxOpenTime = flag.Duration("max-age", 10*365*24*time.Hour, "Maximum time since last activity for PR assignment")
@@ -53,7 +52,7 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 		fmt.Fprintf(os.Stderr, "  GITHUB_APP_ID               - GitHub App ID\n")
-		fmt.Fprintf(os.Stderr, "  GITHUB_APP_KEY              - GitHub App private key content (PEM format)\n")
+		fmt.Fprintf(os.Stderr, "  GITHUB_APP_KEY              - Secret name in Google Secret Manager for private key\n")
 		fmt.Fprintf(os.Stderr, "  GITHUB_APP_KEY_PATH         - Path to GitHub App private key file\n")
 		fmt.Fprintf(os.Stderr, "  PORT                        - HTTP server port (default: 8080)\n")
 	}
@@ -73,9 +72,6 @@ func main() {
 	}
 	if effectiveAppKey == "" {
 		effectiveAppKey = os.Getenv("GITHUB_APP_KEY_PATH")
-		if effectiveAppKey == "" {
-			effectiveAppKey = os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
-		}
 	}
 
 	// Validate credentials
@@ -84,11 +80,9 @@ func main() {
 		slog.Info("Set via --app-id flag or GITHUB_APP_ID environment variable")
 		os.Exit(1)
 	}
-	hasKey := effectiveAppKey != "" || os.Getenv("GITHUB_APP_KEY") != ""
-	if !hasKey {
-		slog.Error("GitHub App private key is required")
-		slog.Info("Set via --app-key-path flag, GITHUB_APP_KEY, or GITHUB_APP_KEY_PATH environment variable")
-		os.Exit(1)
+	// Note: GITHUB_APP_KEY will be checked via gsm.Secret in auth.go
+	if effectiveAppKey == "" {
+		slog.Info("No GITHUB_APP_KEY_PATH provided, will attempt to use GITHUB_APP_KEY from Google Secret Manager")
 	}
 
 	ctx := context.Background()
@@ -122,16 +116,8 @@ func main() {
 		maxOpenTime:       *maxOpenTime,
 	}
 
-	if *serve {
-		slog.Info("Starting in server mode", "loop_delay", *loopDelay)
-		bot.runServeMode(ctx, *loopDelay)
-	} else {
-		slog.Info("Running single pass")
-		if err := bot.processAllOrgs(ctx); err != nil {
-			slog.Error("Failed to process organizations", "error", err)
-			os.Exit(1)
-		}
-	}
+	slog.Info("Starting in server mode", "loop_delay", *loopDelay)
+	bot.runServeMode(ctx, *loopDelay)
 }
 
 // Bot manages reviewer assignment across all installed organizations.
@@ -361,18 +347,9 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 		slog.Warn("Failed to list organizations for sprinkler", "error", err)
 	} else {
 		for _, org := range orgs {
-			// Set current org to get its installation token
-			b.client.SetCurrentOrg(org)
-			token, err := b.client.Token(ctx)
-			b.client.SetCurrentOrg("")
-
-			if err != nil {
-				slog.Error("Failed to get token for org", "org", org, "error", err)
-				continue
-			}
-
 			// Create and start sprinkler for this org
-			monitor := newSprinklerMonitor(b, token, org)
+			// Pass a token provider function that gets fresh tokens
+			monitor := newSprinklerMonitor(b, org)
 			if err := monitor.start(ctx); err != nil {
 				slog.Error("Failed to start sprinkler for org", "org", org, "error", err)
 				continue
@@ -453,18 +430,8 @@ func (b *Bot) updateSprinklerMonitors(ctx context.Context) {
 			continue // Already monitoring
 		}
 
-		// Get installation token for this org
-		b.client.SetCurrentOrg(org)
-		token, err := b.client.Token(ctx)
-		b.client.SetCurrentOrg("")
-
-		if err != nil {
-			slog.Error("Failed to get token for new org", "org", org, "error", err)
-			continue
-		}
-
 		// Create and start sprinkler for this org
-		monitor := newSprinklerMonitor(b, token, org)
+		monitor := newSprinklerMonitor(b, org)
 		if err := monitor.start(ctx); err != nil {
 			slog.Error("Failed to start sprinkler for new org", "org", org, "error", err)
 			continue

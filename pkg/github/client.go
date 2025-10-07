@@ -78,7 +78,12 @@ func (c *Client) getToken() string {
 }
 
 // Token returns the current GitHub token for external use (e.g., sprinkler).
+// For App authentication with a currentOrg set, returns the installation token.
+// Otherwise returns the base token (JWT or personal access token).
 func (c *Client) Token(ctx context.Context) (string, error) {
+	if c.isAppAuth && c.currentOrg != "" {
+		return c.getInstallationToken(ctx, c.currentOrg)
+	}
 	return c.getToken(), nil
 }
 
@@ -202,7 +207,7 @@ func retryWithBackoff(ctx context.Context, operation string, fn func() error) er
 		retry.Attempts(uint(maxRetryAttempts)),
 		retry.Delay(initialRetryDelay),
 		retry.MaxDelay(maxRetryDelay),
-		retry.DelayType(retry.BackOffDelay),
+		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
 		retry.MaxJitter(initialRetryDelay/4),
 		retry.OnRetry(func(n uint, err error) {
 			slog.Info("Retry attempt", "component", "retry", "operation", operation, "attempt", n+1, "max_attempts", maxRetryAttempts, "error", err)

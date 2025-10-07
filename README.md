@@ -59,10 +59,15 @@ Monitor all organizations where your GitHub App is installed:
 # Using command-line flags
 ./better-reviewers --app-id "123456" --app-key "/path/to/private-key.pem"
 
-# Using environment variables
+# Using environment variables with file path
 export GITHUB_APP_ID="123456"
-export GITHUB_APP_KEY="/path/to/private-key.pem"
-./better-reviewers --app-id "" --app-key ""  # Flags can be empty to use env vars
+export GITHUB_APP_KEY_PATH="/path/to/private-key.pem"
+./better-reviewers
+
+# Using Google Secret Manager (recommended for production)
+export GITHUB_APP_ID="123456"
+# GITHUB_APP_KEY should be stored in Google Secret Manager
+./better-reviewers
 ```
 
 ### Polling Mode
@@ -97,8 +102,8 @@ export GITHUB_APP_KEY="/path/to/private-key.pem"
 
 For GitHub App authentication:
 - `GITHUB_APP_ID`: Your GitHub App's ID
-- `GITHUB_APP_KEY`: Path to your app's private key file
-- `GITHUB_APP_PRIVATE_KEY_PATH`: (Legacy) Alternative to GITHUB_APP_KEY
+- `GITHUB_APP_KEY`: Secret name in Google Secret Manager (recommended for production)
+- `GITHUB_APP_KEY_PATH`: Path to your app's private key file (for local development)
 
 ## GitHub App Setup
 
