@@ -158,8 +158,8 @@ func resolveAppCredentials(ctx context.Context, appID, appKeyPath string) (*appC
 	if appKeyPath != "" {
 		slog.Info("Using private key file path from command line", "component", "auth", "path", appKeyPath)
 	} else {
-		// Try gsm.Secret first for secure secret retrieval
-		if keyContent, err := gsm.Secret(ctx, "GITHUB_APP_KEY"); err == nil && keyContent != "" {
+		// Try gsm.Fetch first for secure secret retrieval
+		if keyContent, err := gsm.Fetch(ctx, "GITHUB_APP_KEY"); err == nil && keyContent != "" {
 			privateKeyContent = []byte(keyContent)
 			slog.Info("Using GITHUB_APP_KEY from Google Secret Manager", "component", "auth", "bytes", len(privateKeyContent))
 			appKeyPath = ""
