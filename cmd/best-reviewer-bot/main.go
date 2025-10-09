@@ -569,9 +569,6 @@ func (b *Bot) startHealthServer(ctx context.Context) {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("Best Reviewer Bot\n/_-_/health - Health status\n/_-_/poll - Trigger manual poll\n")); err != nil {
-			slog.Warn("Failed to write response", "error", err)
-		}
 	})
 
 	slog.Info("Starting health server", "port", port)
