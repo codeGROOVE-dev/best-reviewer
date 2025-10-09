@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -171,20 +172,32 @@ func (b *Bot) processAllOrgs(ctx context.Context) error {
 	var totalProcessed, totalAssigned, totalSkipped int
 
 	for i, orgName := range orgs {
-		slog.Info("Processing organization", "org", orgName, "progress", fmt.Sprintf("%d/%d", i+1, len(orgs)))
+		// Add timeout per org to prevent one org from blocking everything
+		orgCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 
-		b.client.SetCurrentOrg(orgName)
+		// Wrap each org processing in panic recovery
+		func() {
+			defer cancel()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("Panic while processing org", "org", orgName, "panic", r)
+				}
+			}()
 
-		processed, assigned, skipped := b.processOrg(ctx, orgName)
-		totalProcessed += processed
-		totalAssigned += assigned
-		totalSkipped += skipped
+			slog.Info("Processing organization", "org", orgName, "progress", fmt.Sprintf("%d/%d", i+1, len(orgs)))
 
-		if b.metrics != nil {
-			b.metrics.RecordOrg(orgName)
-		}
+			b.client.SetCurrentOrg(orgName)
+			defer b.client.SetCurrentOrg("")
 
-		b.client.SetCurrentOrg("")
+			processed, assigned, skipped := b.processOrg(orgCtx, orgName)
+			totalProcessed += processed
+			totalAssigned += assigned
+			totalSkipped += skipped
+
+			if b.metrics != nil {
+				b.metrics.RecordOrg(orgName)
+			}
+		}()
 	}
 
 	slog.Info("Completed all organizations",
@@ -197,9 +210,21 @@ func (b *Bot) processAllOrgs(ctx context.Context) error {
 }
 
 // processSinglePR processes a single PR by owner, repo, and number (used by sprinkler).
-func (b *Bot) processSinglePR(ctx context.Context, owner, repo string, prNumber int) error {
+func (b *Bot) processSinglePR(ctx context.Context, owner, repo string, prNumber int) (err error) {
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic while processing single PR", "owner", owner, "repo", repo, "pr", prNumber, "panic", r)
+			err = fmt.Errorf("panic while processing PR: %v", r)
+		}
+	}()
+
+	// Add timeout for single PR processing
+	prCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
 	// Fetch the PR
-	pr, err := b.client.PullRequest(ctx, owner, repo, prNumber)
+	pr, err := b.client.PullRequest(prCtx, owner, repo, prNumber)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PR: %w", err)
 	}
@@ -210,7 +235,7 @@ func (b *Bot) processSinglePR(ctx context.Context, owner, repo string, prNumber 
 	}
 
 	// Process the PR
-	wasAssigned := b.processPR(ctx, pr)
+	wasAssigned := b.processPR(prCtx, pr)
 	if wasAssigned && b.metrics != nil {
 		b.metrics.RecordPRModified(owner, repo, prNumber)
 	}
@@ -408,7 +433,6 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 	} else {
 		for _, org := range orgs {
 			// Create and start sprinkler for this org
-			// Pass a token provider function that gets fresh tokens
 			monitor := newSprinklerMonitor(b, org)
 			if err := monitor.start(ctx); err != nil {
 				slog.Error("Failed to start sprinkler for org", "org", org, "error", err)
@@ -427,26 +451,43 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 		}()
 	}
 
-	// Run immediately, then loop
+	// Start heartbeat logger
+	go b.heartbeat(ctx)
+
+	// Run immediately, then loop with panic recovery
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("Context cancelled, shutting down")
 			return
 		default:
-			slog.Info("Starting reviewer assignment run")
-			startTime := time.Now()
+			// Wrap each iteration in panic recovery
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("Main loop panic recovered", "panic", r)
+						// Don't exit - continue to next iteration after delay
+					}
+				}()
 
-			if err := b.processAllOrgs(ctx); err != nil {
-				slog.Error("Failed to process app installations", "error", err)
-			}
+				slog.Info("Starting reviewer assignment run")
+				startTime := time.Now()
 
-			// Check for new/removed orgs and update sprinkler monitors
-			b.updateSprinklerMonitors(ctx)
+				// Add timeout protection for processAllOrgs
+				processCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+				defer cancel()
 
-			b.metrics.RecordRunComplete()
-			duration := time.Since(startTime)
-			slog.Info("Run completed", "duration", duration, "sleep_duration", loopDelay)
+				if err := b.processAllOrgs(processCtx); err != nil {
+					slog.Error("Failed to process app installations", "error", err)
+				}
+
+				// Check for new/removed orgs and update sprinkler monitors
+				b.updateSprinklerMonitors(ctx)
+
+				b.metrics.RecordRunComplete()
+				duration := time.Since(startTime)
+				slog.Info("Run completed", "duration", duration, "sleep_duration", loopDelay)
+			}()
 
 			// Sleep with context cancellation
 			timer := time.NewTimer(loopDelay)
@@ -457,6 +498,45 @@ func (b *Bot) runServeMode(ctx context.Context, loopDelay time.Duration) {
 			case <-timer.C:
 				// Continue to next iteration
 			}
+		}
+	}
+}
+
+// heartbeat logs periodic status to show the service is alive.
+func (b *Bot) heartbeat(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Heartbeat goroutine panic", "panic", r)
+		}
+	}()
+
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats := b.metrics.Stats()
+
+			// Count connected sprinklers
+			connectedSprinklers := 0
+			totalSprinklers := len(b.sprinklerMonitors)
+			for _, monitor := range b.sprinklerMonitors {
+				status := monitor.healthStatus()
+				isConnected, ok := status["is_connected"].(bool)
+				if ok && isConnected {
+					connectedSprinklers++
+				}
+			}
+
+			slog.Info("Heartbeat - service is alive",
+				"uptime_runs", stats.TotalRuns,
+				"last_run_ago", time.Since(stats.LastRun).Round(time.Second),
+				"sprinklers_connected", fmt.Sprintf("%d/%d", connectedSprinklers, totalSprinklers),
+				"total_prs_seen", stats.PRsSeen,
+				"total_prs_modified", stats.PRsModified)
 		}
 	}
 }
@@ -509,24 +589,69 @@ func (b *Bot) startHealthServer(ctx context.Context) {
 		port = "8080"
 	}
 
+	// Comprehensive health check endpoint for Cloud Run
 	http.HandleFunc("/_-_/health", func(w http.ResponseWriter, _ *http.Request) {
 		stats := b.metrics.Stats()
 
-		status := "ok"
+		status := "healthy"
 		statusCode := http.StatusOK
+		warnings := []string{}
 
+		// Check if main loop is stale
 		if stats.TotalRuns > 0 && time.Since(stats.LastRun) > 15*time.Minute {
-			status = "stale"
+			status = "unhealthy"
 			statusCode = http.StatusServiceUnavailable
+			warnings = append(warnings, fmt.Sprintf("main loop stale (last run: %s ago)", time.Since(stats.LastRun).Round(time.Second)))
 		}
 
-		response := fmt.Sprintf("%s - %d organizations, %d PRs seen, %d PRs modified (last: %s, runs: %d)\n",
-			status, stats.Orgs, stats.PRsSeen, stats.PRsModified,
-			stats.LastRun.Format(time.RFC3339), stats.TotalRuns)
+		// Check sprinkler monitor health
+		sprinklerStatuses := make([]map[string]any, 0, len(b.sprinklerMonitors))
+		allSprinklersHealthy := true
+		for _, monitor := range b.sprinklerMonitors {
+			monitorStatus := monitor.healthStatus()
+			sprinklerStatuses = append(sprinklerStatuses, monitorStatus)
 
+			// Check if monitor is unhealthy
+			isRunning, runningOK := monitorStatus["is_running"].(bool)
+			isConnected, connectedOK := monitorStatus["is_connected"].(bool)
+			orgName, _ := monitorStatus["org"].(string)
+
+			if runningOK && !isRunning {
+				allSprinklersHealthy = false
+				warnings = append(warnings, fmt.Sprintf("sprinkler for %s not running", orgName))
+			} else if connectedOK && !isConnected {
+				allSprinklersHealthy = false
+				warnings = append(warnings, fmt.Sprintf("sprinkler for %s disconnected", orgName))
+			}
+		}
+
+		if !allSprinklersHealthy && status == "healthy" {
+			status = "degraded"
+			statusCode = http.StatusOK // Still OK but degraded
+		}
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
-		if _, err := w.Write([]byte(response)); err != nil {
-			slog.Warn("Failed to write response", "error", err)
+
+		response := map[string]any{
+			"status":    status,
+			"timestamp": time.Now().Format(time.RFC3339),
+			"main_loop": map[string]any{
+				"total_runs":   stats.TotalRuns,
+				"last_run":     stats.LastRun.Format(time.RFC3339),
+				"orgs":         stats.Orgs,
+				"prs_seen":     stats.PRsSeen,
+				"prs_modified": stats.PRsModified,
+			},
+			"sprinklers": sprinklerStatuses,
+		}
+
+		if len(warnings) > 0 {
+			response["warnings"] = warnings
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			slog.Warn("Failed to encode health response", "error", err)
 		}
 	})
 
