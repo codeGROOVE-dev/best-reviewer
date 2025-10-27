@@ -25,7 +25,7 @@ clean:
 deploy:
 	./hacks/deploy.sh ./cmd/best-reviewer-bot
 
-# BEGIN: lint-install /Users/t/dev/r2r/github-smart-reviewer-bot/
+# BEGIN: lint-install .
 # http://github.com/codeGROOVE-dev/lint-install
 
 .PHONY: lint
@@ -97,9 +97,19 @@ yamllint-lint: $(YAMLLINT_BIN)
 	PYTHONPATH=$(YAMLLINT_ROOT)/dist $(YAMLLINT_ROOT)/dist/bin/yamllint .
 
 .PHONY: _lint $(LINTERS)
-_lint: $(LINTERS)
+_lint:
+	@exit_code=0; \
+	for target in $(LINTERS); do \
+		$(MAKE) $$target || exit_code=1; \
+	done; \
+	exit $$exit_code
 
 .PHONY: fix $(FIXERS)
-fix: $(FIXERS)
+fix:
+	@exit_code=0; \
+	for target in $(FIXERS); do \
+		$(MAKE) $$target || exit_code=1; \
+	done; \
+	exit $$exit_code
 
-# END: lint-install /Users/t/dev/r2r/github-smart-reviewer-bot/
+# END: lint-install .

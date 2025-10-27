@@ -1,3 +1,4 @@
+//nolint:revive,govet // Line length exceeded for logging; fieldalignment for anonymous structs acceptable
 package github
 
 import (
@@ -46,7 +47,7 @@ func (c *Client) pullRequestWithUpdatedAt(
 
 	slog.Info("Fetching PR details to get title, state, author, assignees, reviewers, and metadata", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +167,7 @@ func (c *Client) OpenPullRequestsForOrg(ctx context.Context, org string) ([]*typ
 		encodedQuery := url.QueryEscape(query)
 		apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=%d&page=%d", encodedQuery, perPage, page)
 
-		resp, err := c.makeRequest(ctx, "GET", apiURL, nil) //nolint:bodyclose // body is closed immediately, not deferred
+		resp, err := c.doRequest(ctx, "GET", apiURL, nil) //nolint:bodyclose // body is closed immediately, not deferred
 		if err != nil {
 			return nil, fmt.Errorf("failed to search PRs: %w", err)
 		}
@@ -182,15 +183,15 @@ func (c *Client) OpenPullRequestsForOrg(ctx context.Context, org string) ([]*typ
 
 		var searchResult struct {
 			Items []struct {
-				Number      int    `json:"number"`
-				Title       string `json:"title"`
-				State       string `json:"state"`
-				Draft       bool   `json:"draft"`
-				UpdatedAt   string `json:"updated_at"`
-				PullRequest struct {
+				Title         string `json:"title"`
+				State         string `json:"state"`
+				UpdatedAt     string `json:"updated_at"`
+				RepositoryURL string `json:"repository_url"`
+				PullRequest   struct {
 					URL string `json:"url"`
 				} `json:"pull_request"`
-				RepositoryURL string `json:"repository_url"`
+				Number int  `json:"number"`
+				Draft  bool `json:"draft"`
 			} `json:"items"`
 			TotalCount int `json:"total_count"`
 		}
@@ -250,7 +251,7 @@ func (c *Client) OpenPullRequests(ctx context.Context, owner, repo string) ([]*t
 
 		// Extract API call to avoid defer in loop
 		prs, shouldBreak, err := func() ([]json.RawMessage, bool, error) {
-			resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+			resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 			if err != nil {
 				return nil, false, err
 			}
@@ -319,7 +320,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 
 	slog.Info("Fetching changed files for PR to determine modified files for reviewer expertise matching", "component", "api", "owner", owner, "repo", repo, "pr", prNumber, "cache", "miss")
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +367,7 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repo string, prNumber 
 func (c *Client) lastCommitTime(ctx context.Context, owner, repo, sha string) (time.Time, error) {
 	slog.Info("Fetching commit details to get last commit timestamp for PR staleness analysis", "component", "api", "owner", owner, "repo", repo, "sha", sha)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits/%s", owner, repo, sha)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -395,7 +396,7 @@ func (c *Client) lastCommitTime(ctx context.Context, owner, repo, sha string) (t
 func (c *Client) lastReviewTime(ctx context.Context, owner, repo string, prNumber int) (time.Time, error) {
 	slog.Info("Fetching review history for PR to determine last review timestamp for staleness detection", "component", "api", "owner", owner, "repo", repo, "pr", prNumber)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -447,17 +448,17 @@ func (c *Client) convertPrxToPullRequest(ctx context.Context, owner, repo string
 	// Type assert to get the prx data structure
 	// We use interface{} to avoid import cycles, so we need to use reflection or type assertion
 	type prxPullRequest struct {
-		Number             int
-		Title              string
-		State              string
-		Draft              bool
-		Author             string
-		TestState          string
 		CreatedAt          time.Time
 		UpdatedAt          time.Time
-		HeadSHA            string
 		RequestedReviewers []string
 		Assignees          []string
+		Title              string
+		State              string
+		Author             string
+		TestState          string
+		HeadSHA            string
+		Number             int
+		Draft              bool
 	}
 
 	type prxPullRequestData struct {

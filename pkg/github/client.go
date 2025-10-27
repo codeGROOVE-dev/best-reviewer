@@ -42,12 +42,12 @@ type Client struct {
 
 // Config holds configuration for creating a new GitHub client.
 type Config struct {
-	HTTPTimeout time.Duration
-	CacheTTL    time.Duration
 	CacheDir    string // Directory for disk cache (empty = memory-only)
 	AppID       string
 	AppKeyPath  string
 	Token       string // Personal access token (for non-app auth)
+	HTTPTimeout time.Duration
+	CacheTTL    time.Duration
 	UseAppAuth  bool
 }
 
@@ -106,11 +106,11 @@ func drainAndCloseBody(body io.ReadCloser) {
 // MakeRequest makes an HTTP request to the GitHub API with retry logic.
 // This is exported to allow other packages to make authenticated GitHub API requests.
 func (c *Client) MakeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
-	return c.makeRequest(ctx, method, apiURL, body)
+	return c.doRequest(ctx, method, apiURL, body)
 }
 
-// makeRequest makes an HTTP request to the GitHub API with retry logic.
-func (c *Client) makeRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
+// doRequest makes an HTTP request to the GitHub API with retry logic.
+func (c *Client) doRequest(ctx context.Context, method, apiURL string, body any) (*http.Response, error) {
 	// Refresh JWT if needed
 	if c.isAppAuth {
 		if err := c.refreshJWTIfNeeded(); err != nil {
@@ -244,7 +244,7 @@ func (c *Client) AddReviewers(ctx context.Context, owner, repo string, prNumber 
 		"reviewers": reviewers,
 	}
 
-	resp, err := c.makeRequest(ctx, "POST", url, payload) //nolint:bodyclose // body is closed via defer drainAndCloseBody
+	resp, err := c.doRequest(ctx, "POST", url, payload) //nolint:bodyclose // body is closed via defer drainAndCloseBody
 	if err != nil {
 		return fmt.Errorf("failed to add reviewers: %w", err)
 	}
