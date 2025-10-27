@@ -1,3 +1,4 @@
+//nolint:revive // Line length exceeded for logging clarity - detailed log messages preferred over splitting
 package github
 
 import (
@@ -493,7 +494,7 @@ func (c *Client) ListAppInstallations(ctx context.Context) ([]string, error) {
 
 	slog.Info("Fetching GitHub App installations", "component", "api")
 	apiURL := "https://api.github.com/app/installations"
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get app installations: %w", err)
 	}

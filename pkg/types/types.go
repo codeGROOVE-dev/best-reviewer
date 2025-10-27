@@ -1,4 +1,6 @@
 // Package types contains shared data structures used across the reviewer system.
+//
+//nolint:revive // "types" is a standard Go package name for shared data structures
 package types
 
 import "time"

@@ -1,3 +1,4 @@
+//nolint:revive // Line length exceeded in logging for detailed debug context
 package reviewer
 
 import (
@@ -11,8 +12,8 @@ import (
 )
 
 // blameForLines uses GitHub's blame API to find who last touched specific lines in a file.
-// Returns two lists: overlapping PRs (touched exact lines), and file PRs (touched file within last year).
-func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string, lineRanges [][2]int) ([]types.PRInfo, []types.PRInfo, error) {
+// Returns two lists: overlappingPRs (touched exact lines), and filePRs (touched file within last year).
+func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string, lineRanges [][2]int) (overlappingPRs, filePRs []types.PRInfo, err error) {
 	slog.InfoContext(ctx, "Using blame API to find line authors", "file", filepath, "line_ranges", len(lineRanges))
 
 	if len(lineRanges) == 0 {
@@ -83,7 +84,7 @@ func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string
 	}
 
 	// Parse blame results - get both overlapping and all PRs
-	overlappingPRs, filePRs := f.parseBlameResults(result, lineRanges)
+	overlappingPRs, filePRs = f.parseBlameResults(result, lineRanges)
 	slog.InfoContext(ctx, "Blame API found PRs", "file", filepath, "overlapping_count", len(overlappingPRs), "file_contributors_count", len(filePRs))
 
 	return overlappingPRs, filePRs, nil
@@ -91,9 +92,9 @@ func (f *Finder) blameForLines(ctx context.Context, owner, repo, filepath string
 
 // parseBlameResults extracts PR info from blame GraphQL response for specific line ranges.
 // Returns two lists: PRs that overlap with changed lines, and all PRs in the file.
-func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) ([]types.PRInfo, []types.PRInfo) {
-	var overlappingPRs []types.PRInfo
-	var allPRs []types.PRInfo
+//
+//nolint:gocognit,maintidx // High complexity inherent to parsing GraphQL blame data with line range matching
+func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (overlappingPRs, allPRs []types.PRInfo) {
 	seenOverlapping := make(map[int]bool)
 	seenAll := make(map[int]bool)
 	seenOverlappingCommits := make(map[string]bool)
@@ -280,24 +281,27 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 		}
 
 		// Add to appropriate list(s)
-		if overlaps {
+		switch {
+		case overlaps:
 			// Overlapping lines - always include with full weight
 			if !seenOverlapping[int(prNumber)] {
 				seenOverlapping[int(prNumber)] = true
 				overlappingPRs = append(overlappingPRs, pr)
 				slog.Debug("Added overlapping PR", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "line_count", pr.LineCount)
 			}
-		} else if mergedAt.IsZero() {
+		case mergedAt.IsZero():
 			// Non-overlapping - skip if no mergedAt
 			slog.Debug("Skipping non-overlapping PR (no mergedAt)", "pr_number", int(prNumber), "author", pr.Author)
-		} else if !mergedAt.After(oneYearAgo) {
+		case !mergedAt.After(oneYearAgo):
 			// Non-overlapping - skip if too old
 			slog.Debug("Skipping non-overlapping PR (too old)", "pr_number", int(prNumber), "author", pr.Author, "merged_at", mergedAt)
-		} else if !seenAll[int(prNumber)] {
+		case !seenAll[int(prNumber)]:
 			// Non-overlapping - include if within last year and not seen
 			seenAll[int(prNumber)] = true
 			allPRs = append(allPRs, pr)
 			slog.Debug("Added non-overlapping file contributor", "pr_number", int(prNumber), "author", pr.Author, "mergedBy", pr.MergedBy, "reviewers", pr.Reviewers, "merged_at", mergedAt)
+		default:
+			// Already seen - skip
 		}
 	}
 

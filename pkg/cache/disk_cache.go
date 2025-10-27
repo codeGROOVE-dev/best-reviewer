@@ -47,9 +47,9 @@ const (
 
 // diskEntry represents a cache entry on disk with TTL.
 type diskEntry struct {
-	Value      json.RawMessage `json:"value"`
 	Expiration time.Time       `json:"expiration"`
 	CachedAt   time.Time       `json:"cached_at"`
+	Value      json.RawMessage `json:"value"`
 }
 
 // DiskCache provides two-tier caching: in-memory + disk persistence.
@@ -90,13 +90,17 @@ func NewDiskCache(ttl time.Duration, cacheDir string) (*DiskCache, error) {
 	return dc, nil
 }
 
-// CacheHitType indicates where a cache value was found.
-type CacheHitType string
+// HitType indicates where a cache value was found.
+type HitType string
 
+// Cache hit type constants.
 const (
-	CacheHitMemory CacheHitType = "memory"
-	CacheHitDisk   CacheHitType = "disk"
-	CacheMiss      CacheHitType = "miss"
+	// CacheHitMemory indicates the value was found in memory cache.
+	CacheHitMemory HitType = "memory"
+	// CacheHitDisk indicates the value was found in disk cache.
+	CacheHitDisk HitType = "disk"
+	// CacheMiss indicates the value was not found in cache.
+	CacheMiss HitType = "miss"
 )
 
 // Get retrieves a value from cache (memory first, then disk).
@@ -106,7 +110,7 @@ func (c *DiskCache) Get(key string) (any, bool) {
 }
 
 // Lookup retrieves a value from cache and indicates where it was found.
-func (c *DiskCache) Lookup(key string) (any, CacheHitType) {
+func (c *DiskCache) Lookup(key string) (any, HitType) {
 	// Try memory cache first
 	if value, found := c.Cache.Get(key); found {
 		return value, CacheHitMemory

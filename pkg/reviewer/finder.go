@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -36,7 +37,7 @@ func New(client *github.Client, cfg Config) *Finder {
 // Returns a list of reviewer candidates sorted by relevance.
 func (f *Finder) Find(ctx context.Context, pr *types.PullRequest) ([]types.ReviewerCandidate, error) {
 	if pr == nil {
-		return nil, fmt.Errorf("pr cannot be nil")
+		return nil, errors.New("pr cannot be nil")
 	}
 
 	slog.Info("Finding reviewers for PR", "pr", pr.Number, "owner", pr.Owner, "repo", pr.Repository)

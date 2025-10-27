@@ -26,15 +26,15 @@ const (
 
 // UserCache provides caching for user information.
 type UserCache struct {
-	mu    sync.RWMutex
 	users map[string]*UserInfo
+	mu    sync.RWMutex
 }
 
 // UserInfo holds cached information about a GitHub user.
 type UserInfo struct {
+	LastUpdate time.Time
 	IsBot      bool
 	HasAccess  bool
-	LastUpdate time.Time
 }
 
 // NewUserCache creates a new user cache.
@@ -319,7 +319,7 @@ func (c *Client) BatchOpenPRCount(ctx context.Context, org string, users []strin
 	// Parse response
 	data, ok := resp["data"].(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("invalid GraphQL response structure")
+		return nil, errors.New("invalid GraphQL response structure")
 	}
 
 	// Extract counts for each user
@@ -361,7 +361,7 @@ func (c *Client) searchPRCount(ctx context.Context, query string) (int, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/search/issues?q=%s&per_page=1", encodedQuery)
 	slog.Debug("Search query", "query", query)
 	slog.Debug("Full URL", "url", apiURL)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -439,7 +439,7 @@ func (c *Client) Collaborators(ctx context.Context, owner, repo string) ([]strin
 	// Use affiliation=all to include both direct collaborators and org members
 	// permission=push ensures we only get users with write access or higher
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/collaborators?affiliation=all&permission=push", owner, repo)
-	resp, err := c.makeRequest(ctx, "GET", apiURL, nil)
+	resp, err := c.doRequest(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch collaborators: %w", err)
 	}

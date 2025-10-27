@@ -1,3 +1,4 @@
+//nolint:revive,govet // Line length for logging; fieldalignment after reordering; control nesting for WebSocket logic
 package main
 
 import (
@@ -28,16 +29,16 @@ const (
 
 // sprinklerMonitor manages WebSocket event subscriptions for a single org.
 type sprinklerMonitor struct {
+	mu                sync.RWMutex
+	lastConnectedAt   time.Time // Last successful connection time
+	lastEventAt       time.Time // Last event received time (for health monitoring)
 	bot               *Bot
 	client            *client.Client
 	eventChan         chan string          // Channel for PR URLs that need processing
 	lastEventMap      map[string]time.Time // Track last event per URL to dedupe
-	lastConnectedAt   time.Time            // Last successful connection time
-	lastEventAt       time.Time            // Last event received time (for health monitoring)
+	stopChan          chan struct{}        // Channel to signal monitor should stop
 	org               string               // Organization this monitor is for
 	reconnectAttempts int                  // Current reconnection attempt count
-	stopChan          chan struct{}        // Channel to signal monitor should stop
-	mu                sync.RWMutex
 	isRunning         bool
 	isConnected       bool // Track WebSocket connection status
 	isStopped         bool // Track if monitor was explicitly stopped
@@ -55,6 +56,8 @@ func newSprinklerMonitor(bot *Bot, org string) *sprinklerMonitor {
 }
 
 // start begins monitoring for PR events for this org.
+//
+//nolint:unparam // Error return kept for interface consistency with other lifecycle methods
 func (sm *sprinklerMonitor) start(ctx context.Context) error {
 	sm.mu.Lock()
 	if sm.isRunning {
@@ -381,36 +384,36 @@ func (sm *sprinklerMonitor) processEvent(ctx context.Context, prURL string) {
 	startTime := time.Now()
 
 	// Parse PR URL to extract owner, repo, and number
-	owner, repo, number, err := parsePRURL(prURL)
+	ref, err := parsePRURL(prURL)
 	if err != nil {
 		slog.Warn("Failed to parse PR URL", "component", "sprinkler", "url", prURL, "error", err)
 		return
 	}
 
-	slog.Info("Processing PR event", "component", "sprinkler", "owner", owner, "repo", repo, "pr", number)
+	slog.Info("Processing PR event", "component", "sprinkler", "owner", ref.owner, "repo", ref.repo, "pr", ref.number)
 
 	// Set the current org for the GitHub client
-	sm.bot.client.SetCurrentOrg(owner)
+	sm.bot.client.SetCurrentOrg(ref.owner)
 	defer sm.bot.client.SetCurrentOrg("")
 
 	// Process the PR with retry logic
 	err = retry.Do(func() error {
-		return sm.bot.processSinglePR(ctx, owner, repo, number)
+		return sm.bot.processSinglePR(ctx, ref.owner, ref.repo, ref.number)
 	},
 		retry.Attempts(sprinklerMaxRetries),
 		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
 		retry.MaxDelay(sprinklerMaxDelay),
 		retry.OnRetry(func(n uint, err error) {
-			slog.Info("Retrying PR processing", "component", "sprinkler", "attempt", n+1, "owner", owner, "repo", repo, "pr", number, "error", err)
+			slog.Info("Retrying PR processing", "component", "sprinkler", "attempt", n+1, "owner", ref.owner, "repo", ref.repo, "pr", ref.number, "error", err)
 		}),
 		retry.Context(ctx),
 	)
 	if err != nil {
 		slog.Error("Failed to process PR after retries",
 			"component", "sprinkler",
-			"owner", owner,
-			"repo", repo,
-			"pr", number,
+			"owner", ref.owner,
+			"repo", ref.repo,
+			"pr", ref.number,
 			"elapsed", time.Since(startTime).Round(time.Millisecond),
 			"error", err)
 		return
@@ -418,9 +421,9 @@ func (sm *sprinklerMonitor) processEvent(ctx context.Context, prURL string) {
 
 	slog.Info("Successfully processed PR",
 		"component", "sprinkler",
-		"owner", owner,
-		"repo", repo,
-		"pr", number,
+		"owner", ref.owner,
+		"repo", ref.repo,
+		"pr", ref.number,
 		"elapsed", time.Since(startTime).Round(time.Millisecond))
 }
 
@@ -481,22 +484,30 @@ func (sm *sprinklerMonitor) healthStatus() map[string]any {
 	return status
 }
 
+// prRef holds a parsed PR reference.
+type prRef struct {
+	owner  string
+	repo   string
+	number int
+}
+
 // parsePRURL extracts owner, repo, and PR number from URL.
 // URL format: https://github.com/owner/repo/pull/123
-func parsePRURL(url string) (owner, repo string, number int, err error) {
+func parsePRURL(url string) (*prRef, error) {
 	const minParts = 7
 	parts := strings.Split(url, "/")
 	if len(parts) < minParts || parts[2] != "github.com" {
-		return "", "", 0, fmt.Errorf("invalid GitHub PR URL format: %s", url)
+		return nil, fmt.Errorf("invalid GitHub PR URL format: %s", url)
 	}
 
-	owner = parts[3]
-	repo = parts[4]
+	owner := parts[3]
+	repo := parts[4]
 
+	var number int
 	_, scanErr := fmt.Sscanf(parts[6], "%d", &number)
 	if scanErr != nil {
-		return "", "", 0, fmt.Errorf("invalid PR number in URL: %s", url)
+		return nil, fmt.Errorf("invalid PR number in URL: %s", url)
 	}
 
-	return owner, repo, number, nil
+	return &prRef{owner: owner, repo: repo, number: number}, nil
 }

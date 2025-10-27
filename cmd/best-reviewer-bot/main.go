@@ -58,14 +58,14 @@ type MetricsCollector struct {
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "GitHub App bot that automatically assigns reviewers to PRs across all installed organizations.\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprint(os.Stderr, "GitHub App bot that automatically assigns reviewers to PRs across all installed organizations.\n\n")
+		fmt.Fprint(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
-		fmt.Fprintf(os.Stderr, "  GITHUB_APP_ID               - GitHub App ID\n")
-		fmt.Fprintf(os.Stderr, "  GITHUB_APP_KEY              - Secret name in Google Secret Manager for private key\n")
-		fmt.Fprintf(os.Stderr, "  GITHUB_APP_KEY_PATH         - Path to GitHub App private key file\n")
-		fmt.Fprintf(os.Stderr, "  PORT                        - HTTP server port (default: 8080)\n")
+		fmt.Fprint(os.Stderr, "\nEnvironment Variables:\n")
+		fmt.Fprint(os.Stderr, "  GITHUB_APP_ID               - GitHub App ID\n")
+		fmt.Fprint(os.Stderr, "  GITHUB_APP_KEY              - Secret name in Google Secret Manager for private key\n")
+		fmt.Fprint(os.Stderr, "  GITHUB_APP_KEY_PATH         - Path to GitHub App private key file\n")
+		fmt.Fprint(os.Stderr, "  PORT                        - HTTP server port (default: 8080)\n")
 	}
 	flag.Parse()
 
@@ -320,7 +320,7 @@ func (b *Bot) processPR(ctx context.Context, pr *types.PullRequest) bool {
 		maxReviewers = len(candidates)
 	}
 	reviewers := make([]string, 0, maxReviewers)
-	for i := 0; i < maxReviewers; i++ {
+	for i := range maxReviewers {
 		reviewers = append(reviewers, candidates[i].Username)
 	}
 
@@ -614,7 +614,10 @@ func (b *Bot) startHealthServer(ctx context.Context) {
 			// Check if monitor is unhealthy
 			isRunning, runningOK := monitorStatus["is_running"].(bool)
 			isConnected, connectedOK := monitorStatus["is_connected"].(bool)
-			orgName, _ := monitorStatus["org"].(string)
+			orgName, orgOK := monitorStatus["org"].(string)
+			if !orgOK {
+				orgName = "unknown"
+			}
 
 			if runningOK && !isRunning {
 				allSprinklersHealthy = false

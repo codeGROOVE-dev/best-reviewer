@@ -69,7 +69,7 @@ func TestGoModPR(t *testing.T) {
 	// Mock recent project activity (last 200 PRs)
 	// k4leung4 is very active (387 points), others less so
 	recentPRs := make([]types.PRInfo, 200)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		// k4leung4 authors ~65%, merges ~90%, reviews ~95% of PRs
 		author := "k4leung4"
 		if i%3 == 0 {
@@ -322,7 +322,7 @@ func TestMultiFileCodePR(t *testing.T) {
 	// Mock recent project activity (simpler pattern - not as dominated by one user)
 	recentPRs := make([]types.PRInfo, 100)
 	authors := []string{"tstromberg", "stevebeattie", "eslerm", "antitree", "egibs"}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		author := authors[i%len(authors)]
 		merger := "tstromberg" // Most PRs merged by maintainer
 		if i%4 == 0 {
@@ -914,7 +914,7 @@ func TestLargeScaleMultiDirectoryPR(t *testing.T) {
 	recentPRs := make([]types.PRInfo, 200)
 	maintainers := []string{"medyagh", "spowelljr", "afbjorklund"}
 	contributors := []string{"nirs", "ComradeProgrammer", "flushthemoney", "amorey"}
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		// medyagh is involved in ~80% of PRs (authors 40%, merges 90%, reviews 60%)
 		var author string
 		if i%5 == 0 {
@@ -929,11 +929,12 @@ func TestLargeScaleMultiDirectoryPR(t *testing.T) {
 		}
 
 		var reviewers []string
-		if i%3 == 0 {
+		switch i % 3 {
+		case 0:
 			reviewers = []string{"medyagh", "afbjorklund"}
-		} else if i%3 == 1 {
+		case 1:
 			reviewers = []string{"medyagh", "spowelljr"}
-		} else {
+		default:
 			reviewers = []string{"spowelljr", "afbjorklund"}
 		}
 
@@ -1020,7 +1021,8 @@ func TestMultiDirectoryAggregation(t *testing.T) {
 	}
 
 	// Combine as if they came from different directories
-	allDirPRs := append(dir1PRs, dir2PRs...)
+	dir1PRs = append(dir1PRs, dir2PRs...)
+	allDirPRs := dir1PRs
 
 	// Calculate scores
 	scores := calculateExpectedScores(nil, nil, allDirPRs, nil)

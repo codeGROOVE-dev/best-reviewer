@@ -13,14 +13,16 @@ import (
 
 // candidateWeight represents a reviewer candidate with their weight.
 type candidateWeight struct {
-	username        string
 	sourceScores    map[string]int // Score breakdown by source: "file-author" -> 10, "recent-merger" -> 50, etc.
+	username        string
 	weight          int
 	workloadPenalty int
 	finalScore      int
 }
 
 // findReviewersOptimized finds reviewers using scoring with workload penalties.
+//
+//nolint:gocognit,revive,maintidx // High complexity and length inherent to multi-source reviewer scoring algorithm
 func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullRequest) []types.ReviewerCandidate {
 	// Get the 3 files with the largest delta, excluding lock files
 	// Build candidate map to accumulate scores from all sources
@@ -64,6 +66,7 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 	}
 
 	// Source 3: Directory-level contributions (last 10 commits to each directory)
+	//nolint:nestif // Nested logic required for multi-directory contributor analysis
 	if len(topFiles) > 0 {
 		// Get unique directories from top changed files
 		seenDirs := make(map[string]bool)
@@ -393,7 +396,8 @@ func (*Finder) topChangedFilesFiltered(pr *types.PullRequest, n int) []string {
 }
 
 // collectWeightedCandidates collects candidates using GitHub blame API to find line-level experts.
-// collectWeightedCandidates collects candidates using GitHub blame API to find line-level experts.
+//
+//nolint:gocognit // High complexity required for line-level blame analysis and scoring
 func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRequest, files []string) []candidateWeight {
 	candidateMap := make(map[string]*candidateWeight)
 
@@ -548,6 +552,8 @@ func (f *Finder) collectWeightedCandidates(ctx context.Context, pr *types.PullRe
 
 // getChangedLines extracts the line ranges that were modified in a file for this PR.
 // Returns array of [startLine, endLine] pairs.
+//
+//nolint:unparam // Error return kept for interface consistency and future extensibility
 func (*Finder) getChangedLines(pr *types.PullRequest, filename string) ([][2]int, error) {
 	// Find the file in the PR's changed files
 	var targetFile *types.ChangedFile
@@ -572,31 +578,32 @@ func (*Finder) getChangedLines(pr *types.PullRequest, filename string) ([][2]int
 			// Extract the new file line range (second set of numbers)
 			parts := strings.Split(line, " ")
 			for i, part := range parts {
-				if strings.HasPrefix(part, "+") && i > 0 {
-					// Format is +start,count or just +start
-					numPart := strings.TrimPrefix(part, "+")
-
-					var start, count int
-					if strings.Contains(numPart, ",") {
-						if _, err := fmt.Sscanf(numPart, "%d,%d", &start, &count); err != nil {
-							continue
-						}
-					} else {
-						if _, err := fmt.Sscanf(numPart, "%d", &start); err != nil {
-							continue
-						}
-						count = 1
-					}
-
-					if start > 0 {
-						end := start + count - 1
-						if end < start {
-							end = start
-						}
-						lineRanges = append(lineRanges, [2]int{start, end})
-					}
-					break
+				if !strings.HasPrefix(part, "+") || i == 0 {
+					continue
 				}
+				// Format is +start,count or just +start
+				numPart := strings.TrimPrefix(part, "+")
+
+				var start, count int
+				if strings.Contains(numPart, ",") {
+					if _, err := fmt.Sscanf(numPart, "%d,%d", &start, &count); err != nil {
+						continue
+					}
+				} else {
+					if _, err := fmt.Sscanf(numPart, "%d", &start); err != nil {
+						continue
+					}
+					count = 1
+				}
+
+				if start > 0 {
+					end := start + count - 1
+					if end < start {
+						end = start
+					}
+					lineRanges = append(lineRanges, [2]int{start, end})
+				}
+				break
 			}
 		}
 	}
