@@ -17,6 +17,10 @@ $(BEST_REVIEWER_BOT_BIN):
 	mkdir -p $(OUT_DIR)
 	go build -o $@ ./cmd/best-reviewer-bot
 
+.PHONY: test
+test:
+	go test -cover -race ./...
+
 .PHONY: clean
 clean:
 	rm -rf $(OUT_DIR)
