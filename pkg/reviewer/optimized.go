@@ -81,7 +81,7 @@ func (f *Finder) findReviewersOptimized(ctx context.Context, pr *types.PullReque
 
 		// Query each directory for recent commits
 		for _, dir := range dirs {
-			dirPRs, err := f.recentCommitsInDirectory(ctx, pr.Owner, pr.Repository, dir, 10)
+			dirPRs, err := f.recentCommitsInDirectory(ctx, pr.Owner, pr.Repository, dir)
 			if err != nil {
 				slog.Warn("Failed to fetch directory commits, continuing without", "dir", dir, "error", err)
 				continue

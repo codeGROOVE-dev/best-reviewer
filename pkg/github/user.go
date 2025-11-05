@@ -420,8 +420,8 @@ func (c *Client) cachedPR(owner, repo string, prNumber int, expectedUpdatedAt *t
 // cachePR stores a PR in cache.
 func (c *Client) cachePR(pr *types.PullRequest) {
 	cacheKey := makeCacheKey("pr", pr.Owner, pr.Repository, strconv.Itoa(pr.Number))
-	// Use a longer TTL for PR caching (20 days) since we validate with updated_at
-	c.cache.SetWithTTL(cacheKey, pr, 20*24*time.Hour)
+	// Use a longer TTL for PR caching (3 days) since we validate with updated_at
+	c.cache.SetWithTTL(cacheKey, pr, 3*24*time.Hour)
 }
 
 // Collaborators returns a list of users with write access to the repository.

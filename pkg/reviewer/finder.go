@@ -1,3 +1,4 @@
+// Package reviewer finds appropriate code reviewers for pull requests based on file history and expertise.
 package reviewer
 
 import (
@@ -14,7 +15,7 @@ import (
 
 // Finder finds and selects reviewers for pull requests.
 type Finder struct {
-	client       *github.Client
+	client       github.API
 	cache        *cache.Cache
 	prCountCache time.Duration
 }
@@ -25,7 +26,7 @@ type Config struct {
 }
 
 // New creates a new Finder with the given GitHub client and configuration.
-func New(client *github.Client, cfg Config) *Finder {
+func New(client github.API, cfg Config) *Finder {
 	return &Finder{
 		client:       client,
 		cache:        cache.New(cacheTTL),

@@ -309,7 +309,8 @@ func (f *Finder) parseBlameResults(result map[string]any, lineRanges [][2]int) (
 }
 
 // recentCommitsInDirectory finds recent commits in a directory and their associated PRs.
-func (f *Finder) recentCommitsInDirectory(ctx context.Context, owner, repo, dirPath string, limit int) ([]types.PRInfo, error) {
+func (f *Finder) recentCommitsInDirectory(ctx context.Context, owner, repo, dirPath string) ([]types.PRInfo, error) {
+	limit := 10
 	slog.InfoContext(ctx, "Querying recent commits in directory", "owner", owner, "repo", repo, "dir", dirPath, "limit", limit)
 
 	cacheKey := fmt.Sprintf("commits-dir:%s/%s:%s:%d", owner, repo, dirPath, limit)

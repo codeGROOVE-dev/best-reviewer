@@ -67,10 +67,7 @@ func (c *Client) SetCurrentOrg(org string) {
 }
 
 // SetPrxClient sets the prx client for enhanced PR data fetching.
-func (c *Client) SetPrxClient(prxClient interface {
-	PullRequestWithReferenceTime(ctx context.Context, owner, repo string, prNumber int, referenceTime time.Time) (any, error)
-},
-) {
+func (c *Client) SetPrxClient(prxClient PrxClient) {
 	c.prxClient = prxClient
 }
 
