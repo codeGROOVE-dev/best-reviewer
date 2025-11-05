@@ -1,4 +1,3 @@
-// Package reviewer provides intelligent reviewer selection for pull requests.
 package reviewer
 
 import "time"

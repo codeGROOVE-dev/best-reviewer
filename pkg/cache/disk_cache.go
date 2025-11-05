@@ -126,8 +126,13 @@ func (c *DiskCache) Lookup(key string) (any, HitType) {
 	slog.Debug("Checking disk cache", "key", key, "file", cacheFile)
 
 	var entry diskEntry
-	if !c.loadFromDisk(key, &entry) {
-		slog.Debug("Disk cache file not found or unreadable", "key", key)
+	loaded, corrupted := c.loadFromDisk(key, &entry)
+	if !loaded {
+		if corrupted {
+			// Remove corrupted file
+			slog.Debug("Removing corrupted disk cache file", "key", key)
+			c.removeFromDisk(key)
+		}
 		return nil, CacheMiss
 	}
 
@@ -155,6 +160,11 @@ func (c *DiskCache) Lookup(key string) (any, HitType) {
 	}
 
 	return value, CacheHitDisk
+}
+
+// Set stores a value in both memory and disk cache with the default TTL.
+func (c *DiskCache) Set(key string, value any) {
+	c.SetWithTTL(key, value, c.ttl)
 }
 
 // SetWithTTL stores a value in both memory and disk cache.
@@ -198,15 +208,21 @@ func (*DiskCache) cacheKey(key string) string {
 }
 
 // loadFromDisk loads a cache entry from disk.
-func (c *DiskCache) loadFromDisk(key string, v any) bool {
+// Returns (loaded, corrupted) where:
+// - loaded=true means the entry was successfully loaded
+// - corrupted=true means the file exists but is corrupted (should be removed).
+func (c *DiskCache) loadFromDisk(key string, v any) (loaded bool, corrupted bool) {
 	path := filepath.Join(c.cacheDir, c.cacheKey(key)+".json")
 
 	file, err := os.Open(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			slog.Debug("Failed to open disk cache file", "error", err, "path", path)
+			// File exists but can't be opened - consider it corrupted
+			return false, true
 		}
-		return false
+		// File doesn't exist - not corrupted, just missing
+		return false, false
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
@@ -216,10 +232,11 @@ func (c *DiskCache) loadFromDisk(key string, v any) bool {
 
 	if err := json.NewDecoder(file).Decode(v); err != nil {
 		slog.Debug("Failed to decode disk cache file", "error", err, "path", path)
-		return false
+		// File exists but JSON is invalid - corrupted
+		return false, true
 	}
 
-	return true
+	return true, false
 }
 
 // saveToDisk saves a cache entry to disk atomically.
