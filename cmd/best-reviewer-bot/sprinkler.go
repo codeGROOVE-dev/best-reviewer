@@ -23,7 +23,7 @@ const (
 	sprinklerMaxDelay      = 10 * time.Second // Max delay between retries
 	connectionHealthCheck  = 2 * time.Minute  // Check connection health every 2 minutes
 	connectionStaleTimeout = 5 * time.Minute  // Reconnect if no connection for 5 minutes
-	maxReconnectAttempts   = 5                // Max reconnection attempts before giving up
+	maxReconnectAttempts   = 100              // Max reconnection attempts (high limit for production reliability)
 	reconnectBackoff       = 30 * time.Second // Initial backoff between reconnection attempts
 )
 
@@ -85,6 +85,8 @@ func (sm *sprinklerMonitor) start(ctx context.Context) error {
 }
 
 // manageConnection manages the WebSocket connection with automatic reconnection.
+// The sprinkler client has its own internal reconnection logic with exponential backoff.
+// This function handles restarting the client only when it gives up or encounters fatal errors.
 func (sm *sprinklerMonitor) manageConnection(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -109,26 +111,35 @@ func (sm *sprinklerMonitor) manageConnection(ctx context.Context) {
 				return
 			}
 
+			// connectWebSocket() blocks until the client gives up or context is cancelled
+			// The client has internal retry logic, so this only returns on fatal errors
 			if err := sm.connectWebSocket(ctx); err != nil {
+				// Check if it's a context cancellation (expected during shutdown)
+				if errors.Is(err, context.Canceled) {
+					slog.Info("WebSocket client stopped due to context cancellation", "component", "sprinkler", "org", sm.org)
+					return
+				}
+
 				sm.mu.Lock()
 				sm.reconnectAttempts++
 				attempts := sm.reconnectAttempts
 				sm.mu.Unlock()
 
 				if attempts >= maxReconnectAttempts {
-					slog.Error("Max reconnection attempts reached, giving up", "component", "sprinkler", "org", sm.org, "attempts", attempts)
+					slog.Error("Max outer reconnection attempts reached, giving up", "component", "sprinkler", "org", sm.org, "attempts", attempts)
 					return
 				}
 
+				// Only retry if it's not an auth error (client already retried internally)
 				backoff := reconnectBackoff * time.Duration(attempts)
 				if backoff > 5*time.Minute {
 					backoff = 5 * time.Minute
 				}
 
-				slog.Warn("WebSocket connection failed, will retry",
+				slog.Warn("WebSocket client gave up, will restart after backoff",
 					"component", "sprinkler",
 					"org", sm.org,
-					"attempt", attempts,
+					"outer_attempt", attempts,
 					"backoff", backoff,
 					"error", err)
 
@@ -138,22 +149,25 @@ func (sm *sprinklerMonitor) manageConnection(ctx context.Context) {
 				case <-sm.stopChan:
 					return
 				case <-time.After(backoff):
-					continue
+					// Continue to next iteration to restart client
 				}
-			}
+			} else {
+				// Clean exit (shouldn't happen normally since client runs indefinitely)
+				slog.Info("WebSocket client exited cleanly", "component", "sprinkler", "org", sm.org)
 
-			// Connection succeeded, reset reconnect attempts
-			sm.mu.Lock()
-			sm.reconnectAttempts = 0
-			sm.mu.Unlock()
+				// Reset reconnect attempts on clean exit
+				sm.mu.Lock()
+				sm.reconnectAttempts = 0
+				sm.mu.Unlock()
 
-			// Wait a bit before attempting to reconnect after a disconnect
-			select {
-			case <-ctx.Done():
-				return
-			case <-sm.stopChan:
-				return
-			case <-time.After(5 * time.Second):
+				// Small delay before restarting
+				select {
+				case <-ctx.Done():
+					return
+				case <-sm.stopChan:
+					return
+				case <-time.After(5 * time.Second):
+				}
 			}
 		}
 	}
@@ -161,18 +175,19 @@ func (sm *sprinklerMonitor) manageConnection(ctx context.Context) {
 
 // connectWebSocket establishes a WebSocket connection.
 func (sm *sprinklerMonitor) connectWebSocket(ctx context.Context) error {
-	// Get fresh token - the client will automatically refresh if needed
-	sm.bot.client.SetCurrentOrg(sm.org)
-	token, err := sm.bot.client.Token(ctx)
-	sm.bot.client.SetCurrentOrg("")
-	if err != nil {
-		return fmt.Errorf("failed to get token: %w", err)
-	}
-
 	config := client.Config{
-		ServerURL:      "wss://" + client.DefaultServerAddress + "/ws",
-		Token:          token,
-		Organization:   sm.org,
+		ServerURL:    "wss://" + client.DefaultServerAddress + "/ws",
+		Organization: sm.org,
+		// Use TokenProvider for dynamic token refresh instead of static Token
+		TokenProvider: func() (string, error) {
+			sm.bot.client.SetCurrentOrg(sm.org)
+			token, err := sm.bot.client.Token(ctx)
+			sm.bot.client.SetCurrentOrg("")
+			if err != nil {
+				return "", fmt.Errorf("failed to get token: %w", err)
+			}
+			return token, nil
+		},
 		EventTypes:     []string{"pull_request"},
 		UserEventsOnly: false,
 		Verbose:        false,
@@ -268,30 +283,14 @@ func (sm *sprinklerMonitor) monitorHealth(ctx context.Context) {
 					"connected_for", timeSinceConnect.Round(time.Second),
 					"time_since_last_event", timeSinceEvent.Round(time.Second))
 			} else {
-				// Not connected - check if we've been disconnected too long
+				// Not connected - just log status
+				// Don't force reconnection - let manageConnection and the client's internal retry handle it
 				if !lastConnected.IsZero() {
 					disconnectedFor := now.Sub(lastConnected)
 					slog.Warn("Sprinkler health check - disconnected",
 						"component", "sprinkler",
 						"org", sm.org,
 						"disconnected_for", disconnectedFor.Round(time.Second))
-
-					// Force reconnection if disconnected for too long
-					if disconnectedFor > connectionStaleTimeout {
-						slog.Warn("Connection stale, forcing reconnection",
-							"component", "sprinkler",
-							"org", sm.org,
-							"disconnected_for", disconnectedFor.Round(time.Second))
-
-						// Stop current client if any
-						sm.mu.RLock()
-						wsClient := sm.client
-						sm.mu.RUnlock()
-
-						if wsClient != nil {
-							wsClient.Stop()
-						}
-					}
 				} else {
 					slog.Info("Sprinkler health check - not yet connected",
 						"component", "sprinkler",

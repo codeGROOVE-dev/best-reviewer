@@ -29,6 +29,8 @@ type Ticker interface {
 }
 
 // API defines operations for interacting with GitHub API.
+//
+//nolint:interfacebloat // GitHub API client legitimately requires many methods for different operations
 type API interface {
 	// Authentication and configuration
 	SetCurrentOrg(org string)
